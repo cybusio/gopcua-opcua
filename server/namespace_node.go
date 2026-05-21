@@ -83,22 +83,31 @@ func (as *NodeNameSpace) AddNode(n *Node) *Node {
 	as.mu.Lock()
 	defer as.mu.Unlock()
 
-	/*
-		nn := &Node{
-			id:   n.id,
-			attr: maps.Clone(n.attr),
-			refs: slices.Clone(n.refs),
-			val:  n.val,
-			ns:   as,
-		}
-	*/
-
-	// todo(fs): this is wrong since this leaves the old node in the list.
-	as.nodes = append(as.nodes, n)
 	k := n.ID().String()
-
+	if _, exists := as.m[k]; !exists {
+		as.nodes = append(as.nodes, n)
+	}
 	as.m[k] = n
 	return n
+}
+
+// RemoveNode removes a node from the namespace by its NodeID.
+// It removes the node from both the map lookup and the nodes slice.
+func (as *NodeNameSpace) RemoveNode(id *ua.NodeID) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+
+	k := id.String()
+	if _, exists := as.m[k]; !exists {
+		return
+	}
+	delete(as.m, k)
+	for i, n := range as.nodes {
+		if n.ID().String() == k {
+			as.nodes = append(as.nodes[:i], as.nodes[i+1:]...)
+			break
+		}
+	}
 }
 
 func (as *NodeNameSpace) AddNewVariableNode(name string, value any) *Node {
@@ -122,7 +131,10 @@ func (as *NodeNameSpace) Attribute(id *ua.NodeID, attr ua.AttributeID) *ua.DataV
 		}
 	}
 
-	if !n.Access(ua.AccessLevelTypeCurrentRead) {
+	// OPC UA Part 3 §5.6.2: AccessLevel restricts the Value attribute only.
+	// All other attributes (NodeClass, BrowseName, DisplayName, …) must
+	// remain readable regardless of the access level.
+	if attr == ua.AttributeIDValue && !n.Access(ua.AccessLevelTypeCurrentRead) {
 		return &ua.DataValue{
 			EncodingMask:    ua.DataValueServerTimestamp | ua.DataValueStatusCode,
 			ServerTimestamp: time.Now(),
