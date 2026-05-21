@@ -172,7 +172,7 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 	var encryptedLength int
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric {
 		plaintextBlockSize := c.algo.PlaintextBlockSize()
-		extraPadding := c.algo.RemoteSignatureLength() > 256
+		extraPadding := c.algo.SignatureLength() > 256
 		paddingBytes := 1
 		if extraPadding {
 			paddingBytes = 2
@@ -211,11 +211,10 @@ func (c *channelInstance) signAndEncrypt(m *Message, b []byte) ([]byte, error) {
 }
 
 func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, error) {
-	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeNone {
+	isAsymmetric := m.AsymmetricSecurityHeader != nil
+	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeNone && (!isAsymmetric || m.SecurityPolicyURI == ua.SecurityPolicyURINone) {
 		return m.Data, nil
 	}
-
-	isAsymmetric := m.AsymmetricSecurityHeader != nil
 
 	headerLength := 12
 
@@ -246,7 +245,7 @@ func (c *channelInstance) verifyAndDecrypt(m *MessageChunk, r []byte) ([]byte, e
 	var paddingLength int
 	if c.sc.cfg.SecurityMode == ua.MessageSecurityModeSignAndEncrypt || isAsymmetric {
 		paddingLength = int(messageToVerify[len(messageToVerify)-1])
-		if c.algo.SignatureLength() > 256 {
+		if c.algo.RemoteSignatureLength() > 256 {
 			paddingLength <<= 8
 			paddingLength += int(messageToVerify[len(messageToVerify)-2])
 			paddingLength += 1
