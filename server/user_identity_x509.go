@@ -71,17 +71,30 @@ func defaultUserIdentityFromCert(cert *x509.Certificate) (string, error) {
 	return cert.Subject.CommonName, nil
 }
 
-// x509TokenValidationError is returned by ValidateX509IdentityToken
+// X509TokenValidationError is returned by ValidateX509IdentityToken
 // when the token must be rejected. The Status field is the OPC UA
 // status code the caller must propagate to the client per Part 4
 // §5.6.3.
-type x509TokenValidationError struct {
+type X509TokenValidationError struct {
 	Status ua.StatusCode
 	Reason string
 }
 
-func (e *x509TokenValidationError) Error() string {
+func (e *X509TokenValidationError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Status, e.Reason)
+}
+
+// X509TokenStatusFromError extracts the spec-mandated StatusCode from a
+// validation error returned by ValidateX509IdentityToken. The second
+// return is false when err is not (or does not wrap) an
+// *X509TokenValidationError, so callers can supply their own fallback
+// without leaking a non-spec status code.
+func X509TokenStatusFromError(err error) (ua.StatusCode, bool) {
+	var ve *X509TokenValidationError
+	if errors.As(err, &ve) {
+		return ve.Status, true
+	}
+	return 0, false
 }
 
 // ValidateX509IdentityToken validates a client X.509 UserIdentityToken
@@ -107,20 +120,27 @@ func (e *x509TokenValidationError) Error() string {
 // callers that need to enforce a particular channel mode must do so
 // before calling this function.
 func ValidateX509IdentityToken(
-	cfg *serverConfig,
+	srv *Server,
 	token *ua.X509IdentityToken,
 	tokenSignature *ua.SignatureData,
 	serverCertificate []byte,
 	serverNonce []byte,
 ) (*x509.Certificate, string, error) {
+	if srv == nil || srv.cfg == nil {
+		return nil, "", &X509TokenValidationError{
+			Status: ua.StatusBadInternalError,
+			Reason: "nil server",
+		}
+	}
+	cfg := srv.cfg
 	if token == nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenInvalid,
 			Reason: "nil X509IdentityToken",
 		}
 	}
 	if len(token.CertificateData) == 0 {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenInvalid,
 			Reason: "empty certificate data",
 		}
@@ -128,7 +148,7 @@ func ValidateX509IdentityToken(
 
 	cert, err := x509.ParseCertificate(token.CertificateData)
 	if err != nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadCertificateInvalid,
 			Reason: "parse client certificate: " + err.Error(),
 		}
@@ -137,7 +157,7 @@ func ValidateX509IdentityToken(
 	// Expiry check (Part 4 §A.2).
 	now := time.Now()
 	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadCertificateInvalid,
 			Reason: "certificate not within validity period",
 		}
@@ -149,7 +169,7 @@ func ValidateX509IdentityToken(
 	// client cert can chain to itself, and a CA-issued client cert can
 	// chain via its CA.
 	if len(cfg.trustedClientCerts) == 0 {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "no trusted client certificates configured",
 		}
@@ -175,7 +195,7 @@ func ValidateX509IdentityToken(
 		KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
 	}
 	if _, err := cert.Verify(verifyOpts); err != nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "untrusted client certificate: " + err.Error(),
 		}
@@ -188,28 +208,28 @@ func ValidateX509IdentityToken(
 	// ServerNonce that was issued at CreateSession time and re-issued at
 	// each ActivateSession.
 	if tokenSignature == nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "missing UserTokenSignature",
 		}
 	}
 	rsaPub, ok := cert.PublicKey.(*rsa.PublicKey)
 	if !ok {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadCertificateInvalid,
 			Reason: "non-RSA client public key not supported",
 		}
 	}
 	policyURI := signatureURIToPolicyURI(tokenSignature.Algorithm)
 	if policyURI == "" {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "unsupported UserTokenSignature algorithm: " + tokenSignature.Algorithm,
 		}
 	}
 	algo, err := uapolicy.Asymmetric(policyURI, nil, rsaPub)
 	if err != nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "build verifier: " + err.Error(),
 		}
@@ -218,7 +238,7 @@ func ValidateX509IdentityToken(
 	signed = append(signed, serverCertificate...)
 	signed = append(signed, serverNonce...)
 	if err := algo.VerifySignature(signed, tokenSignature.Signature); err != nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "token signature verification failed: " + err.Error(),
 		}
@@ -231,13 +251,13 @@ func ValidateX509IdentityToken(
 	}
 	identity, err := resolver(cert)
 	if err != nil {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "identity resolution: " + err.Error(),
 		}
 	}
 	if identity == "" {
-		return nil, "", &x509TokenValidationError{
+		return nil, "", &X509TokenValidationError{
 			Status: ua.StatusBadIdentityTokenRejected,
 			Reason: "empty user identity from certificate",
 		}
