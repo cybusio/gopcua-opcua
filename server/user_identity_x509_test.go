@@ -62,7 +62,7 @@ func TestValidateX509IdentityToken_HappyPath(t *testing.T) {
 	serverCert := []byte("server-cert-bytes")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{trustedClientCerts: [][]byte{clientDER}}
+	srv := &Server{cfg: &serverConfig{trustedClientCerts: [][]byte{clientDER}}}
 	tok := &ua.X509IdentityToken{PolicyID: "x509", CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -71,7 +71,7 @@ func TestValidateX509IdentityToken_HappyPath(t *testing.T) {
 		Signature: signWithRSA(t, clientKey, signed),
 	}
 
-	cert, identity, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
+	cert, identity, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
 	if err != nil {
 		t.Fatalf("validation failed: %v", err)
 	}
@@ -90,7 +90,7 @@ func TestValidateX509IdentityToken_UntrustedCert(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{trustedClientCerts: [][]byte{otherDER}} // trust an unrelated cert
+	srv := &Server{cfg: &serverConfig{trustedClientCerts: [][]byte{otherDER}}} // trust an unrelated cert
 	tok := &ua.X509IdentityToken{CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -99,8 +99,8 @@ func TestValidateX509IdentityToken_UntrustedCert(t *testing.T) {
 		Signature: signWithRSA(t, clientKey, signed),
 	}
 
-	_, _, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
-	var ve *x509TokenValidationError
+	_, _, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
+	var ve *X509TokenValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected x509TokenValidationError, got %v", err)
 	}
@@ -116,7 +116,7 @@ func TestValidateX509IdentityToken_ExpiredCert(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{trustedClientCerts: [][]byte{expiredDER}}
+	srv := &Server{cfg: &serverConfig{trustedClientCerts: [][]byte{expiredDER}}}
 	tok := &ua.X509IdentityToken{CertificateData: expiredDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -125,8 +125,8 @@ func TestValidateX509IdentityToken_ExpiredCert(t *testing.T) {
 		Signature: signWithRSA(t, expiredKey, signed),
 	}
 
-	_, _, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
-	var ve *x509TokenValidationError
+	_, _, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
+	var ve *X509TokenValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected x509TokenValidationError, got %v", err)
 	}
@@ -141,7 +141,7 @@ func TestValidateX509IdentityToken_TamperedSignature(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{trustedClientCerts: [][]byte{clientDER}}
+	srv := &Server{cfg: &serverConfig{trustedClientCerts: [][]byte{clientDER}}}
 	tok := &ua.X509IdentityToken{CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -154,8 +154,8 @@ func TestValidateX509IdentityToken_TamperedSignature(t *testing.T) {
 		Signature: tampered,
 	}
 
-	_, _, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
-	var ve *x509TokenValidationError
+	_, _, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
+	var ve *X509TokenValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected x509TokenValidationError, got %v", err)
 	}
@@ -170,7 +170,7 @@ func TestValidateX509IdentityToken_EmptyTrustList(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{} // empty trust list
+	srv := &Server{cfg: &serverConfig{}} // empty trust list
 	tok := &ua.X509IdentityToken{CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -179,8 +179,8 @@ func TestValidateX509IdentityToken_EmptyTrustList(t *testing.T) {
 		Signature: signWithRSA(t, clientKey, signed),
 	}
 
-	_, _, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
-	var ve *x509TokenValidationError
+	_, _, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
+	var ve *X509TokenValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected x509TokenValidationError, got %v", err)
 	}
@@ -195,13 +195,13 @@ func TestValidateX509IdentityToken_CustomIdentityResolver(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{
+	srv := &Server{cfg: &serverConfig{
 		trustedClientCerts: [][]byte{clientDER},
 		userIdentityFromCert: func(c *x509.Certificate) (string, error) {
 			// Custom hook: derive identity from serial number.
 			return "serial:" + c.SerialNumber.String(), nil
 		},
-	}
+	}}
 	tok := &ua.X509IdentityToken{CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -210,7 +210,7 @@ func TestValidateX509IdentityToken_CustomIdentityResolver(t *testing.T) {
 		Signature: signWithRSA(t, clientKey, signed),
 	}
 
-	_, identity, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
+	_, identity, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
 	if err != nil {
 		t.Fatalf("validation failed: %v", err)
 	}
@@ -225,12 +225,12 @@ func TestValidateX509IdentityToken_IdentityResolverError(t *testing.T) {
 	serverCert := []byte("server")
 	serverNonce := []byte("01234567890123456789012345678901")
 
-	cfg := &serverConfig{
+	srv := &Server{cfg: &serverConfig{
 		trustedClientCerts: [][]byte{clientDER},
 		userIdentityFromCert: func(c *x509.Certificate) (string, error) {
 			return "", errors.New("not mappable")
 		},
-	}
+	}}
 	tok := &ua.X509IdentityToken{CertificateData: clientDER}
 	signed := append([]byte{}, serverCert...)
 	signed = append(signed, serverNonce...)
@@ -239,8 +239,8 @@ func TestValidateX509IdentityToken_IdentityResolverError(t *testing.T) {
 		Signature: signWithRSA(t, clientKey, signed),
 	}
 
-	_, _, err := ValidateX509IdentityToken(cfg, tok, sig, serverCert, serverNonce)
-	var ve *x509TokenValidationError
+	_, _, err := ValidateX509IdentityToken(srv, tok, sig, serverCert, serverNonce)
+	var ve *X509TokenValidationError
 	if !errors.As(err, &ve) {
 		t.Fatalf("expected x509TokenValidationError, got %v", err)
 	}
