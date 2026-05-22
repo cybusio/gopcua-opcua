@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/rand"
+	"errors"
 	"log"
 	"strings"
 	"time"
@@ -124,6 +125,39 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 			s.srv.cfg.logger.Warn("error verifying session signature with nonce: %s", err)
 		}
 		return nil, ua.StatusBadSecurityChecksFailed
+	}
+
+	// Inspect the UserIdentityToken. Per OPC UA Part 4 §5.6.3 the
+	// server validates the presented identity token before issuing a
+	// fresh ServerNonce. The vendored gopcua used to skip this step
+	// entirely; the fork adds X.509 validation here while leaving the
+	// existing Anonymous / UserName / nil-token paths unchanged so
+	// consumers that override ActivateSession via RegisterHandler keep
+	// working.
+	if req.UserIdentityToken != nil {
+		if tok, ok := req.UserIdentityToken.Value.(*ua.X509IdentityToken); ok {
+			_, identity, vErr := ValidateX509IdentityToken(
+				s.srv.cfg,
+				tok,
+				req.UserTokenSignature,
+				s.srv.cfg.certificate,
+				sess.serverNonce,
+			)
+			if vErr != nil {
+				if s.srv.cfg.logger != nil {
+					s.srv.cfg.logger.Warn("rejecting X.509 UserIdentityToken: %s", vErr)
+				}
+				var ve *x509TokenValidationError
+				if errors.As(vErr, &ve) {
+					return nil, ve.Status
+				}
+				return nil, ua.StatusBadIdentityTokenRejected
+			}
+			sess.userIdentity = identity
+		}
+		// Anonymous / UserName / IssuedToken: keep legacy behavior.
+		// Consumers that need to validate those override
+		// ActivateSession via RegisterHandler.
 	}
 
 	nonce := make([]byte, sessionNonceLength)
