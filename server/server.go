@@ -67,6 +67,24 @@ type serverConfig struct {
 	enabledSec  []security
 	enabledAuth []authMode
 
+	// maxSessions is the cap on concurrent OPC UA sessions known to the
+	// session broker. Zero means "no cap" (legacy gopcua behavior).
+	// Enforced by SessionService.CreateSession before sessionBroker.NewSession.
+	maxSessions int
+
+	// maxConnections is the cap on concurrent UACP connections registered
+	// with the channel broker. Zero means "no cap" (legacy gopcua behavior).
+	// Enforced by Server.acceptAndRegister before registering the
+	// freshly-accepted net.Conn.
+	maxConnections int
+
+	// resourcePath, when non-empty, is appended as the URL path component
+	// to every configured endpoint after option processing. A leading '/'
+	// is normalized; trailing '/' is stripped. The TCP listener does not
+	// parse the path — the path only surfaces in EndpointURL strings
+	// returned by GetEndpoints / CreateSession.
+	resourcePath string
+
 	cap ServerCapabilities
 
 	logger Logger
@@ -107,6 +125,16 @@ func New(opts ...Option) *Server {
 	}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	// Append the configured resource path to every endpoint URL exactly
+	// once. ResourcePath may be set before or after EndPoint() in the
+	// option list — normalizing here makes the order irrelevant. Empty
+	// string keeps legacy gopcua behavior.
+	if cfg.resourcePath != "" {
+		path := normalizeResourcePath(cfg.resourcePath)
+		for i, ep := range cfg.endpoints {
+			cfg.endpoints[i] = ep + path
+		}
 	}
 	url := ""
 	if len(cfg.endpoints) != 0 {
@@ -322,6 +350,25 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 				}
 			}
 
+			// Enforce the maxConnections cap before handing the
+			// freshly-accepted connection to the channel broker. The
+			// channel broker's `s` map is the authoritative count of
+			// live secure-channel connections; we read its length under
+			// its own RWMutex to avoid racing with RegisterConn or
+			// connection teardown. A zero cap disables the check
+			// (legacy gopcua behavior).
+			if s.cfg.maxConnections > 0 {
+				s.cb.mu.RLock()
+				count := len(s.cb.s)
+				s.cb.mu.RUnlock()
+				if count >= s.cfg.maxConnections {
+					if s.cfg.logger != nil {
+						s.cfg.logger.Warn("rejecting connection from %s: maxConnections (%d) reached", c.RemoteAddr(), s.cfg.maxConnections)
+					}
+					_ = c.Close()
+					continue
+				}
+			}
 			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey)
 			if s.cfg.logger != nil {
 				s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
@@ -450,4 +497,26 @@ func (s *Server) Node(nid *ua.NodeID) *Node {
 		return s.namespaces[ns].Node(nid)
 	}
 	return nil
+}
+
+// normalizeResourcePath returns the canonical URL-path form for the
+// configured ResourcePath: exactly one leading '/', no trailing '/'.
+// An input that already begins with '/' is not double-slashed; an empty
+// input returns "" so callers can no-op.
+func normalizeResourcePath(p string) string {
+	p = strings.TrimSpace(p)
+	if p == "" {
+		return ""
+	}
+	// Collapse any run of leading slashes to exactly one.
+	for strings.HasPrefix(p, "//") {
+		p = p[1:]
+	}
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
+	}
+	for strings.HasSuffix(p, "/") && len(p) > 1 {
+		p = p[:len(p)-1]
+	}
+	return p
 }
