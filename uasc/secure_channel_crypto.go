@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/binary"
+	"strings"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uapolicy"
@@ -63,10 +64,18 @@ func (s *SecureChannel) VerifySessionSignature(cert, nonce, signature []byte) er
 	return nil
 }
 
-// EncryptUserPassword issues a new signature for the client to send in ActivateSessionRequest
+// EncryptUserPassword issues a new signature for the client to send in ActivateSessionRequest.
+//
+// REQ-PROD-0012: per OPC UA Part 4 §7.36, a UserTokenPolicy with an
+// empty / whitespace-only SecurityPolicyURI inherits the secure
+// channel's SecurityPolicy for purposes of encrypting the user
+// identity token. The fallback below is the second line of defense
+// behind SecurityFromEndpoint (which also folds the policy URI when
+// constructing the option chain). Either guard is sufficient; both
+// must agree.
 func (s *SecureChannel) EncryptUserPassword(policyURI, password string, cert, nonce []byte) ([]byte, string, error) {
 	// If the User ID Token's policy was null, then default to the secure channel's policy
-	if policyURI == "" {
+	if strings.TrimSpace(policyURI) == "" {
 		policyURI = s.cfg.SecurityPolicyURI
 	}
 
@@ -99,11 +108,12 @@ func (s *SecureChannel) EncryptUserPassword(policyURI, password string, cert, no
 	return pass, passAlg, nil
 }
 
-// NewUserTokenSignature issues a new signature for the client to send in ActivateSessionRequest
+// NewUserTokenSignature issues a new signature for the client to send in ActivateSessionRequest.
 // The security policy for the SecureChannel is used if policyURI value is null or empty
+// (REQ-PROD-0012, OPC UA Part 4 §7.36 inherit-channel-policy semantics).
 // https://reference.opcfoundation.org/Core/Part4/v104/docs/7.37
 func (s *SecureChannel) NewUserTokenSignature(policyURI string, cert, nonce []byte) ([]byte, string, error) {
-	if policyURI == "" {
+	if strings.TrimSpace(policyURI) == "" {
 		policyURI = s.cfg.SecurityPolicyURI
 	}
 
