@@ -28,6 +28,29 @@ import (
 
 const defaultListenAddr = "opc.tcp://localhost:0"
 
+// predefinedNodeSet returns the parsed OPC UA NodeSet2 schema baked
+// into the binary. The XML decode is ~3.5 MB and costs ~1.4 s under
+// the race detector on a typical developer machine. Server.New is
+// invoked at least once per server lifetime, and many process-local
+// test harnesses (e.g. multi-agent integration tests) bring up
+// multiple Servers in the same process; under those workloads the
+// per-call decode dominates wall-clock.
+//
+// We parse the nodeset once per process and share the resulting
+// pointer across all callers. Sharing is safe because Server.New /
+// ImportNodeSet treat the returned structure as read-only after this
+// point — see the lazy-mutation-free implementation in
+// nodeset2_import.go. Do not mutate fields of the returned value.
+//
+// REQ-PROD-0017 (cybusio/opcua-server-go).
+var predefinedNodeSet = sync.OnceValue(func() *schema.UANodeSet {
+	nodes := new(schema.UANodeSet)
+	// xml.Unmarshal on a pre-compiled, known-good blob; error is
+	// ignored to preserve the historical Server.New behavior.
+	_ = xml.Unmarshal(schema.OpcUaNodeSet2, nodes)
+	return nodes
+})
+
 // Server is a high-level OPC-UA Server
 type Server struct {
 	url string
@@ -187,8 +210,12 @@ func New(opts ...Option) *Server {
 
 	// this nodeset is pre-compiled into the binary and contains a known set of nodes
 	// so it should *always* work ok.
-	var nodes schema.UANodeSet
-	xml.Unmarshal(schema.OpcUaNodeSet2, &nodes)
+	//
+	// REQ-PROD-0017: parsed once per process and shared across all
+	// Server.New callers via sync.OnceValue. ImportNodeSet must not
+	// mutate the returned structure (the implementation in
+	// nodeset2_import.go was de-mutated to make this guarantee hold).
+	nodes := predefinedNodeSet()
 
 	n0, ok := s.namespaces[0].(*NodeNameSpace)
 	n0.srv = s
@@ -196,7 +223,7 @@ func New(opts ...Option) *Server {
 		// this should never happen because we just set namespace 0 to be a node namespace
 		log.Panic("Namespace 0 is not a node namespace!")
 	}
-	s.ImportNodeSet(&nodes)
+	s.ImportNodeSet(nodes)
 
 	s.namespaces[0].AddNode(CurrentTimeNode())
 	s.namespaces[0].AddNode(NamespacesNode(s))
