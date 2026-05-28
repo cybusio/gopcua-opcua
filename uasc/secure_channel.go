@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/sha1"
 	"crypto/x509"
 	"encoding/binary"
 	"io"
@@ -479,6 +480,18 @@ func (s *SecureChannel) readChunk() (*MessageChunk, error) {
 		s.cfg.SecurityPolicyURI = m.SecurityPolicyURI
 		if m.SecurityPolicyURI != ua.SecurityPolicyURINone {
 			s.cfg.RemoteCertificate = m.AsymmetricSecurityHeader.SenderCertificate
+			// REQ-PROD-0049: OPC UA Part 6 §6.7.2 — the next outgoing
+			// asymmetric chunk on this channel must carry
+			// ReceiverCertificateThumbprint = SHA1(remoteCertificate).
+			// On the server side this is the SHA1 of the client cert
+			// learned from the inbound OPN; on the client side it is
+			// already initialised at session-open time from the
+			// endpoint's ServerCertificate, so re-deriving here is a
+			// no-op for the client direction.
+			if len(s.cfg.RemoteCertificate) > 0 {
+				thumb := sha1.Sum(s.cfg.RemoteCertificate)
+				s.cfg.Thumbprint = thumb[:]
+			}
 			debug.Printf("uasc %d: setting securityPolicy to %s", s.c.ID(), m.SecurityPolicyURI)
 
 			remoteCert, err := x509.ParseCertificate(s.cfg.RemoteCertificate)
