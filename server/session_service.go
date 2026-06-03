@@ -36,6 +36,21 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, err
 	}
 
+	// Enforce the maxSessions cap before allocating a new session in
+	// the broker. Zero disables the cap (legacy gopcua behavior). The
+	// session broker holds its own mutex; read the count under it.
+	if s.srv.cfg.maxSessions > 0 {
+		s.srv.sb.mu.Lock()
+		full := len(s.srv.sb.s) >= s.srv.cfg.maxSessions
+		s.srv.sb.mu.Unlock()
+		if full {
+			if s.srv.cfg.logger != nil {
+				s.srv.cfg.logger.Warn("rejecting CreateSession: maxSessions (%d) reached", s.srv.cfg.maxSessions)
+			}
+			return nil, ua.StatusBadTooManySessions
+		}
+	}
+
 	// New session
 	sess := s.srv.sb.NewSession()
 
