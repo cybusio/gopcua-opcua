@@ -52,6 +52,10 @@ func (s *MonitoredItemService) DeleteMonitoredItem(id uint32) {
 	// we've got to go backwards because we're deleting from the slice as we go.
 	// I'm guessing this loop is less efficient than slices.DeleteFunc but it's what we've got.
 	delete(s.Items, id)
+	if item.pendingTimer != nil {
+		item.pendingTimer.Stop()
+		item.pendingTimer = nil
+	}
 	for i := len(s.Nodes[nodeid]) - 1; i >= 0; i-- {
 		n := s.Nodes[nodeid][i]
 		if n == nil {
@@ -108,30 +112,78 @@ func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
 		return
 	}
 
-	ns, err := s.SubService.srv.Namespace(int(n.Namespace()))
-
+	now := time.Now()
 	for i := range items {
 		item := items[i]
 		if item == nil {
 			continue
 		}
-		val := new(ua.MonitoredItemNotification)
-		val.ClientHandle = item.Req.RequestedParameters.ClientHandle
-		if err != nil {
-			if s.SubService.srv.cfg.logger != nil {
-				s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", n.Namespace(), err)
-			}
-			val.Value = &ua.DataValue{}
-			val.Value.Status = ua.StatusBad
-			val.Value.EncodingMask |= ua.DataValueStatusCode
-			item.Sub.NotifyChannel <- val
-			continue
-		}
-		dv := ns.Attribute(n, item.Req.ItemToMonitor.AttributeID)
-		val.Value = dv
-		item.Sub.NotifyChannel <- val
+		s.queueNotificationLocked(item, n, now)
 	}
 
+}
+
+func (s *MonitoredItemService) queueNotificationLocked(item *MonitoredItem, nodeID *ua.NodeID, now time.Time) {
+	if item == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+		return
+	}
+
+	if item.samplingInterval <= 0 || item.lastSampledAt.IsZero() || now.Sub(item.lastSampledAt) >= item.samplingInterval {
+		s.dispatchNotificationLocked(item, nodeID, now)
+		return
+	}
+
+	if item.pending {
+		return
+	}
+
+	delay := item.samplingInterval - now.Sub(item.lastSampledAt)
+	if delay < 0 {
+		delay = 0
+	}
+	item.pending = true
+	item.pendingTimer = time.AfterFunc(delay, func() {
+		s.firePendingNotification(item.ID)
+	})
+}
+
+func (s *MonitoredItemService) firePendingNotification(id uint32) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	item, ok := s.Items[id]
+	if !ok || item == nil || !item.pending || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+		return
+	}
+
+	s.dispatchNotificationLocked(item, item.Req.ItemToMonitor.NodeID, time.Now())
+}
+
+func (s *MonitoredItemService) dispatchNotificationLocked(item *MonitoredItem, nodeID *ua.NodeID, now time.Time) {
+	val := new(ua.MonitoredItemNotification)
+	if item.Req != nil && item.Req.RequestedParameters != nil {
+		val.ClientHandle = item.Req.RequestedParameters.ClientHandle
+	}
+
+	ns, err := s.SubService.srv.Namespace(int(nodeID.Namespace()))
+	if err != nil {
+		if s.SubService.srv.cfg.logger != nil {
+			s.SubService.srv.cfg.logger.Warn("error getting namespace %d: %v", nodeID.Namespace(), err)
+		}
+		val.Value = &ua.DataValue{}
+		val.Value.Status = ua.StatusBad
+		val.Value.EncodingMask |= ua.DataValueStatusCode
+	} else {
+		val.Value = ns.Attribute(nodeID, item.Req.ItemToMonitor.AttributeID)
+	}
+
+	if item.pendingTimer != nil {
+		item.pendingTimer.Stop()
+		item.pendingTimer = nil
+	}
+	item.pending = false
+	item.lastSampledAt = now
+	item.Sub.NotifyChannel <- val
 }
 
 func (s *MonitoredItemService) NextID() uint32 {
@@ -149,6 +201,12 @@ type MonitoredItem struct {
 
 	//TODO: use this
 	Mode ua.MonitoringMode
+
+	RevisedSamplingInterval float64
+	samplingInterval        time.Duration
+	lastSampledAt           time.Time
+	pending                 bool
+	pendingTimer            *time.Timer
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.12.2
@@ -187,10 +245,14 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	for i := range req.ItemsToCreate {
 		itemreq := req.ItemsToCreate[i]
 		nodeid := itemreq.ItemToMonitor.NodeID
+		revisedSamplingInterval := revisedSamplingInterval(itemreq, sub.RevisedPublishingInterval)
 		item := MonitoredItem{
-			ID:  s.NextID(),
-			Sub: sub,
-			Req: itemreq,
+			ID:                      s.NextID(),
+			Sub:                     sub,
+			Req:                     itemreq,
+			Mode:                    itemreq.MonitoringMode,
+			RevisedSamplingInterval: revisedSamplingInterval,
+			samplingInterval:        samplingDuration(revisedSamplingInterval),
 		}
 
 		// book keeping of the new item
@@ -217,7 +279,7 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		res[i] = &ua.MonitoredItemCreateResult{
 			StatusCode:              ua.StatusOK,
 			MonitoredItemID:         item.ID,
-			RevisedSamplingInterval: sub.RevisedPublishingInterval,
+			RevisedSamplingInterval: revisedSamplingInterval,
 			RevisedQueueSize:        1,
 			FilterResult:            ua.NewExtensionObject(nil),
 		}
@@ -243,6 +305,31 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 
 	return resp, nil
 
+}
+
+func revisedSamplingInterval(itemreq *ua.MonitoredItemCreateRequest, publishingInterval float64) float64 {
+	if itemreq == nil || itemreq.RequestedParameters == nil {
+		return defaultSamplingInterval(publishingInterval)
+	}
+	requested := itemreq.RequestedParameters.SamplingInterval
+	if requested <= 0 {
+		return defaultSamplingInterval(publishingInterval)
+	}
+	return requested
+}
+
+func defaultSamplingInterval(publishingInterval float64) float64 {
+	if publishingInterval > 0 {
+		return publishingInterval
+	}
+	return 0
+}
+
+func samplingDuration(interval float64) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(interval * float64(time.Millisecond))
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.12.3
