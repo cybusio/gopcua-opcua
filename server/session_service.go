@@ -126,6 +126,36 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
+	// Validate the presented UserIdentityToken before issuing a fresh
+	// ServerNonce (OPC UA Part 4 §5.6.3). Only the X.509 token path is
+	// validated here; the Anonymous / UserName / nil-token paths are
+	// left unchanged so consumers that override ActivateSession via
+	// RegisterHandler keep working.
+	if req.UserIdentityToken != nil {
+		if tok, ok := req.UserIdentityToken.Value.(*ua.X509IdentityToken); ok {
+			_, identity, vErr := ValidateX509IdentityToken(
+				s.srv,
+				tok,
+				req.UserTokenSignature,
+				s.srv.cfg.certificate,
+				sess.serverNonce,
+			)
+			if vErr != nil {
+				if s.srv.cfg.logger != nil {
+					s.srv.cfg.logger.Warn("rejecting X.509 UserIdentityToken: %s", vErr)
+				}
+				if status, ok := X509TokenStatusFromError(vErr); ok {
+					return nil, status
+				}
+				return nil, ua.StatusBadIdentityTokenRejected
+			}
+			sess.userIdentity = identity
+		}
+		// Anonymous / UserName / IssuedToken: keep legacy behavior.
+		// Consumers that need to validate those override
+		// ActivateSession via RegisterHandler.
+	}
+
 	nonce := make([]byte, sessionNonceLength)
 	if _, err := rand.Read(nonce); err != nil {
 		log.Printf("error creating session nonce")
