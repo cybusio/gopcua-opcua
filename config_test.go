@@ -120,6 +120,24 @@ YqvGJP7ubbsR1YoQxQ8CQQCyCrltDYji5+KdxMOsDt0v7bCQWkQ3+pik09faK51Y
 				},
 			},
 		},
+		// username auth on a secured channel where the
+		// UserTokenPolicy advertises an empty SecurityPolicyURI. Per
+		// OPC UA Part 4 §7.36 the channel's SecurityPolicyURI is
+		// inherited. Mirrors the legacy node-opcua "usernamePassword_0
+		// with empty SecurityPolicyURI" advertisement from legacy
+		// node-opcua interop.
+		{
+			SecurityPolicyURI: "Basic256Sha256-uri", // stand-in channel URI
+			SecurityMode:      5,                    // random value for testing
+			ServerCertificate: certDER,
+			UserIdentityTokens: []*ua.UserTokenPolicy{
+				{
+					TokenType:         ua.UserTokenTypeUserName,
+					PolicyID:          "usernamePassword_0",
+					SecurityPolicyURI: "", // inherit from channel
+				},
+			},
+		},
 	}
 )
 
@@ -601,6 +619,31 @@ func TestOptions(t *testing.T) {
 					sc := DefaultSessionConfig()
 					sc.UserIdentityToken = &ua.IssuedIdentityToken{}
 					sc.AuthPolicyURI = "c"
+					return sc
+				}(),
+			},
+		},
+		{
+			// UserName token with empty SecurityPolicyURI
+			// must inherit the channel's SecurityPolicyURI for
+			// AuthPolicyURI (used downstream by EncryptUserPassword).
+			name: `SecurityFromEndpoint(username-no-auth-policy-uri)`,
+			opt:  SecurityFromEndpoint(endpoints[5], ua.UserTokenTypeUserName),
+			cfg: &Config{
+				sechan: func() *uasc.Config {
+					c := DefaultClientConfig()
+					c.SecurityPolicyURI = "Basic256Sha256-uri"
+					c.SecurityMode = 5
+					c.RemoteCertificate = certDER
+					c.Thumbprint = uapolicy.Thumbprint(certDER)
+					return c
+				}(),
+				session: func() *uasc.SessionConfig {
+					sc := DefaultSessionConfig()
+					sc.UserIdentityToken = &ua.UserNameIdentityToken{
+						PolicyID: "usernamePassword_0",
+					}
+					sc.AuthPolicyURI = "Basic256Sha256-uri"
 					return sc
 				}(),
 			},

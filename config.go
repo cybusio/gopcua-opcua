@@ -348,7 +348,16 @@ func setCertificate(cert []byte, cfg *Config) error {
 }
 
 // SecurityFromEndpoint sets the server-related security parameters from
-// a chosen endpoint (received from GetEndpoints())
+// a chosen endpoint (received from GetEndpoints()).
+//
+// Per OPC UA Part 4 §7.36 (UserTokenPolicy), an empty / null
+// SecurityPolicyURI on a UserTokenPolicy means "inherit the
+// SecureChannel's SecurityPolicy" for purposes of encrypting the user
+// identity token. This function therefore falls back to
+// ep.SecurityPolicyURI when the matching UserTokenPolicy advertises
+// no explicit SecurityPolicyURI. EncryptUserPassword
+// applies the same fallback defensively when called with an empty
+// policyURI; both code paths must agree.
 func SecurityFromEndpoint(ep *ua.EndpointDescription, authType ua.UserTokenType) Option {
 	return func(cfg *Config) error {
 		cfg.sechan.SecurityPolicyURI = ep.SecurityPolicyURI
@@ -375,7 +384,12 @@ func SecurityFromEndpoint(ep *ua.EndpointDescription, authType ua.UserTokenType)
 			}
 
 			setPolicyID(cfg.session.UserIdentityToken, t.PolicyID)
-			if t.SecurityPolicyURI != "" {
+			// Part 4 §7.36 inherit-channel-policy
+			// semantics. An empty (or whitespace-only) per-token
+			// SecurityPolicyURI must resolve to the channel's URI so
+			// downstream EncryptUserPassword / NewUserTokenSignature
+			// pick the correct asymmetric algorithm.
+			if strings.TrimSpace(t.SecurityPolicyURI) != "" {
 				cfg.session.AuthPolicyURI = t.SecurityPolicyURI
 			} else {
 				cfg.session.AuthPolicyURI = ep.SecurityPolicyURI
