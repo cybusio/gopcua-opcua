@@ -7,6 +7,7 @@ package server
 import (
 	"context"
 	"crypto/rsa"
+	"crypto/x509"
 	"encoding/xml"
 	"fmt"
 	"log"
@@ -84,6 +85,18 @@ type serverConfig struct {
 	// parse the path — the path only surfaces in EndpointURL strings
 	// returned by GetEndpoints / CreateSession.
 	resourcePath string
+
+	// trustedClientCerts holds the DER-encoded X.509 certificates that
+	// the server accepts as roots / pre-trusted leaves when validating
+	// X.509 UserIdentityToken instances at ActivateSession time. An
+	// empty list rejects every X.509 token. Append via TrustedClientCert.
+	trustedClientCerts [][]byte
+
+	// userIdentityFromCert is the optional hook that maps a validated
+	// client certificate to a user identity string. When nil, the
+	// default mapping is the Subject Common Name (CN). Installed via
+	// UserIdentityFromCert.
+	userIdentityFromCert func(*x509.Certificate) (string, error)
 
 	cap ServerCapabilities
 
