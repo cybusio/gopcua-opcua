@@ -367,6 +367,20 @@ func (n *Node) AddRef(o *Node, rt RefType, forward bool) {
 	n.refs = append(n.refs, &ref)
 }
 
+// RemoveRef removes all forward references from this node that point to the
+// given child node ID.
+func (n *Node) RemoveRef(childID *ua.NodeID) {
+	target := childID.String()
+	filtered := n.refs[:0]
+	for _, r := range n.refs {
+		if r.NodeID != nil && r.NodeID.NodeID.String() == target && r.IsForward {
+			continue
+		}
+		filtered = append(filtered, r)
+	}
+	n.refs = filtered
+}
+
 // Access returns true if the node has the access level requested.
 // It checks both the UserAccessLevel and AccessLevel attributes.
 // If neither are present, it assumes global access and returns true.
