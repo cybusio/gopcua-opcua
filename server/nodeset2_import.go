@@ -361,14 +361,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				continue
 			}
 
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 		}
 
@@ -394,15 +391,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				continue
 			}
 
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
-
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 
 		}
@@ -424,14 +417,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				failures++
 				continue
 			}
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 		}
 	}
@@ -451,14 +441,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				failures++
 				continue
 			}
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 
 		}
@@ -480,14 +467,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				failures++
 				continue
 			}
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 
 		}
@@ -509,14 +493,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				failures++
 				continue
 			}
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 		}
 
@@ -540,14 +521,11 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 				failures++
 				continue
 			}
-			if ref.IsForwardAttr == nil {
-				v := true
-				ref.IsForwardAttr = &v
-			}
+			isForward := refIsForward(ref)
 			reftypeid := ua.MustParseNodeID(reftypes[ref.ReferenceTypeAttr].NodeIdAttr)
-			node.AddRef(n, RefType(reftypeid.IntID()), *ref.IsForwardAttr)
+			node.AddRef(n, RefType(reftypeid.IntID()), isForward)
 			if !reftypes[ref.ReferenceTypeAttr].SymmetricAttr {
-				n.AddRef(node, RefType(reftypeid.IntID()), !*ref.IsForwardAttr)
+				n.AddRef(node, RefType(reftypeid.IntID()), !isForward)
 			}
 
 		}
@@ -555,4 +533,19 @@ func (srv *Server) refsImportNodeSet(nodes *schema.UANodeSet) error {
 	}
 
 	return nil
+}
+
+// refIsForward reads the IsForwardAttr of a parsed schema.Reference
+// without mutating it. The XML schema treats a missing IsForward
+// attribute as `true`. Reading via a local (instead of lazily filling
+// in `ref.IsForwardAttr = &true` on the parsed structure) lets
+// callers share a single parsed UANodeSet across goroutines safely.
+//
+// The shared cache in server.go relies on this function not mutating
+// its argument.
+func refIsForward(ref *schema.Reference) bool {
+	if ref.IsForwardAttr == nil {
+		return true
+	}
+	return *ref.IsForwardAttr
 }
