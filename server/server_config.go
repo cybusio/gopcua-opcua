@@ -172,3 +172,36 @@ func SetLogger(logger Logger) Option {
 		s.logger = logger
 	}
 }
+
+// MaxSessions sets the cap on concurrent OPC UA sessions. A non-positive
+// value disables the cap (legacy gopcua behavior). When the cap is
+// reached, SessionService.CreateSession rejects further requests with
+// StatusBadTooManySessions.
+func MaxSessions(n int) Option {
+	return func(s *serverConfig) {
+		s.maxSessions = n
+	}
+}
+
+// MaxConnections sets the cap on concurrent UACP secure-channel
+// connections registered with the channel broker. A non-positive value
+// disables the cap (legacy gopcua behavior). When the cap is reached,
+// Server.acceptAndRegister closes the freshly-accepted connection
+// instead of handing it to the broker.
+func MaxConnections(n int) Option {
+	return func(s *serverConfig) {
+		s.maxConnections = n
+	}
+}
+
+// ResourcePath sets the URL path component appended to every configured
+// endpoint URL after option processing. A leading slash is normalized
+// (added if missing, no double-slash); trailing slashes are stripped.
+// The empty string disables path-rewriting (legacy gopcua behavior).
+// The TCP listener does not parse the path — the path only surfaces in
+// the EndpointURL strings returned by GetEndpoints / CreateSession.
+func ResourcePath(path string) Option {
+	return func(s *serverConfig) {
+		s.resourcePath = path
+	}
+}
