@@ -18,7 +18,25 @@ type session struct {
 	serverNonce       []byte
 	remoteCertificate []byte
 
+	// userIdentity is the resolved user identity string set at
+	// ActivateSession time when the client presents an
+	// UserTokenTypeCertificate token. Empty for Anonymous and for
+	// UserName tokens (the consuming application owns username
+	// resolution for the latter).
+	userIdentity string
+
 	PublishRequests chan PubReq
+}
+
+// UserIdentity returns the resolved user identity string set at
+// ActivateSession time (from a successfully-validated X.509
+// UserIdentityToken). Returns "" for sessions activated under
+// Anonymous, UserName, or where ActivateSession has not run yet.
+func (s *session) UserIdentity() string {
+	if s == nil {
+		return ""
+	}
+	return s.userIdentity
 }
 
 type sessionConfig struct {
