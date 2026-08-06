@@ -558,26 +558,22 @@ func (c *Client) monitor(ctx context.Context) {
 						// Assume that subsToRecreate and subsToRepublish have been
 						// populated in the previous step.
 
-						activeSubs = 0
-						for _, subID := range subsToRepublish {
-							if err := c.republishSubscription(ctx, subID, availableSeqs[subID]); err != nil {
-								dlog.Printf("republish of subscription %d failed", subID)
-								subsToRecreate = append(subsToRecreate, subID)
-							}
-							activeSubs++
+						action, activeSubs = c.republishOrRecreateSubscriptions(ctx, subsToRepublish, subsToRecreate, availableSeqs)
+						if action == none {
+							c.setState(ctx, Connected)
+							break
 						}
 
-						for _, subID := range subsToRecreate {
-							if err := c.recreateSubscription(ctx, subID); err != nil {
-								dlog.Printf("recreate subscripitions failed: %v", err)
-								action = recreateSession
-								continue
-							}
-							activeSubs++
+						// at least one subscription could not be recreated and action
+						// is recreateSession. back off before retrying so we don't
+						// hot-loop hammering the server when a subscription can never
+						// be restored (e.g. a monitored node was permanently removed
+						// from the server's address space).
+						select {
+						case <-ctx.Done():
+							return
+						case <-time.After(c.cfg.sechan.ReconnectInterval):
 						}
-
-						c.setState(ctx, Connected)
-						action = none
 
 					case abortReconnect:
 						dlog.Printf("action: abortReconnect")

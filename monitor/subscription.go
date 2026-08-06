@@ -1,3 +1,9 @@
+// Package monitor provides an API for subscribing to OPC UA node value changes.
+//
+// The subscription owns ClientHandles: it ignores any value a caller sets and
+// assigns its own, which is how incoming notifications are matched back to
+// nodes. Callers may therefore share one ua.MonitoringParameters across many
+// Requests. See Part 4, 7.21.
 package monitor
 
 import (
@@ -98,10 +104,17 @@ func (m *Item) NodeID() *ua.NodeID {
 
 // Request is a struct to manage a request to monitor a node or modify a monitored node
 type Request struct {
-	NodeID               *ua.NodeID
-	MonitoringMode       ua.MonitoringMode
+	NodeID         *ua.NodeID
+	MonitoringMode ua.MonitoringMode
+
+	// MonitoringParameters holds this node's monitoring settings. Any
+	// ClientHandle you set is ignored: Part 4, 7.21 scopes the handle to a
+	// single MonitoredItem, so the subscription assigns its own on a private,
+	// shallow copy and one instance may be shared across Requests.
+	// The copy leaves Filter and NodeID aliased with the caller; mutating
+	// either afterward is undefined, since Filter is replayed verbatim on
+	// reconnect.
 	MonitoringParameters *ua.MonitoringParameters
-	handle               uint32
 }
 
 // Subscription is an instance of an active subscription.
@@ -322,7 +335,8 @@ func (s *Subscription) AddNodeIDs(ctx context.Context, nodes ...*ua.NodeID) erro
 	return err
 }
 
-// AddMonitorItems adds nodes with monitoring parameters to the subscription
+// AddMonitorItems adds monitored nodes. Any ClientHandle set in a Request is
+// ignored; the subscription assigns its own. See Part 4, 7.21.
 func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([]Item, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -334,21 +348,15 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 	}
 
 	toAdd := make([]*ua.MonitoredItemCreateRequest, 0)
+	allocated := make([]uint32, len(nodes))
 
 	// Add handles and make requests
 	for i, node := range nodes {
 		handle := atomic.AddUint32(&s.monitor.nextClientHandle, 1)
 		s.handles[handle] = nodes[i].NodeID
-		nodes[i].handle = handle
+		allocated[i] = handle
 
-		request := opcua.NewMonitoredItemCreateRequestWithDefaults(node.NodeID, ua.AttributeIDValue, handle)
-		request.MonitoringMode = node.MonitoringMode
-
-		if node.MonitoringParameters != nil {
-			request.RequestedParameters = node.MonitoringParameters
-			request.RequestedParameters.ClientHandle = handle
-		}
-		toAdd = append(toAdd, request)
+		toAdd = append(toAdd, buildCreateRequest(node, handle))
 	}
 	resp, err := s.sub.Monitor(ctx, ua.TimestampsToReturnBoth, toAdd...)
 	if err != nil {
@@ -371,12 +379,12 @@ func (s *Subscription) AddMonitorItems(ctx context.Context, nodes ...Request) ([
 				Status: res.StatusCode,
 			})
 			// Clean up the handle for the failed item
-			delete(s.handles, nodes[i].handle)
+			delete(s.handles, allocated[i])
 			continue
 		}
 		mn := Item{
 			id:     res.MonitoredItemID,
-			handle: nodes[i].handle,
+			handle: allocated[i],
 			nodeID: toAdd[i].ItemToMonitor.NodeID,
 		}
 		s.itemLookup[res.MonitoredItemID] = mn
@@ -463,7 +471,8 @@ func (s *Subscription) RemoveMonitorItems(ctx context.Context, items ...Item) er
 	return nil
 }
 
-// ModifyMonitorItems modifies nodes with monitoring parameters to the subscription
+// ModifyMonitorItems modifies monitored nodes. Any ClientHandle set in a
+// Request is ignored; the subscription assigns its own. See Part 4, 7.21.
 func (s *Subscription) ModifyMonitorItems(ctx context.Context, nodes ...Request) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -472,27 +481,12 @@ func (s *Subscription) ModifyMonitorItems(ctx context.Context, nodes ...Request)
 		return nil
 	}
 
-	toModify := make([]*ua.MonitoredItemModifyRequest, 0)
-
-	for _, node := range nodes {
-		for _, item := range s.itemLookup {
-			if item.nodeID.String() != node.NodeID.String() {
-				continue
-			}
-
-			if node.MonitoringParameters == nil {
-				break
-			}
-
-			request := &ua.MonitoredItemModifyRequest{
-				MonitoredItemID:     item.id,
-				RequestedParameters: node.MonitoringParameters,
-			}
-			request.RequestedParameters.ClientHandle = item.handle
-			toModify = append(toModify, request)
-			break
-		}
+	items := make([]Item, 0, len(s.itemLookup))
+	for _, item := range s.itemLookup {
+		items = append(items, item)
 	}
+
+	toModify := buildModifyRequests(nodes, items)
 
 	resp, err := s.sub.ModifyMonitoredItems(ctx, ua.TimestampsToReturnBoth, toModify...)
 	if err != nil {
