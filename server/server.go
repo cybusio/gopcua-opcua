@@ -456,6 +456,29 @@ func (s *Server) monitorConnections(ctx context.Context) {
 // initEndpoints builds the endpoint list from the server's configuration
 func (s *Server) initEndpoints() {
 	var endpoints []*ua.EndpointDescription
+
+	// A UserName or Certificate token's secret is protected by the
+	// SecurityPolicy named in its UserTokenPolicy, which Part 4 §7.36.4
+	// applies independently of the secure channel's policy. Where the
+	// server has a non-None policy configured, that policy is the one to
+	// advertise for such tokens, and the SecurityPolicy#None variant is
+	// deliberately withheld below: it would ask the client to send the
+	// secret unprotected when a protected option exists.
+	//
+	// Where the server has no other policy configured, withholding it
+	// instead leaves the endpoint advertising no non-Anonymous
+	// UserTokenPolicy at all, so a server configured for UserName
+	// authentication cannot be authenticated against — Part 4 §5.6.3
+	// requires the client to pick a policy from this list. Honour the
+	// configuration in that case.
+	hasSecurePolicy := false
+	for _, sec := range s.cfg.enabledSec {
+		if sec.secPolicy != ua.SecurityPolicyURINone {
+			hasSecurePolicy = true
+			break
+		}
+	}
+
 	for _, sec := range s.cfg.enabledSec {
 		for _, url := range s.cfg.endpoints {
 			secLevel := uapolicy.SecurityLevel(sec.secPolicy, sec.secMode)
@@ -487,7 +510,7 @@ func (s *Server) initEndpoints() {
 						authSec.secPolicy = "http://opcfoundation.org/UA/SecurityPolicy#None"
 					}
 
-					if auth.tokenType != ua.UserTokenTypeAnonymous && authSec.secPolicy == "http://opcfoundation.org/UA/SecurityPolicy#None" {
+					if auth.tokenType != ua.UserTokenTypeAnonymous && authSec.secPolicy == ua.SecurityPolicyURINone && hasSecurePolicy {
 						continue
 					}
 
