@@ -19,22 +19,24 @@ func TestMonitoredItemSamplingIntervalCoalescesRapidChanges(t *testing.T) {
 	}))
 
 	session := srv.sb.NewSession()
-	subResp, err := srv.SubscriptionService.CreateSubscription(nil, &ua.CreateSubscriptionRequest{
-		RequestHeader:               &ua.RequestHeader{AuthenticationToken: session.AuthTokenID},
-		RequestedPublishingInterval: 25,
-		RequestedLifetimeCount:      100,
-		RequestedMaxKeepAliveCount:  10,
-	}, 0)
-	if err != nil {
-		t.Fatalf("CreateSubscription returned error: %v", err)
-	}
 
-	createSubResp := subResp.(*ua.CreateSubscriptionResponse)
-	defer srv.SubscriptionService.DeleteSubscription(createSubResp.SubscriptionID)
+	// Register the subscription directly instead of via CreateSubscription.
+	// CreateSubscription starts the subscription's run loop, which reads from
+	// NotifyChannel; this test reads that channel itself and must be its only
+	// consumer, otherwise the two race for every notification.
+	sub := NewSubscription()
+	sub.srv = srv.SubscriptionService
+	sub.Session = session
+	sub.ID = 1
+	sub.RevisedPublishingInterval = 25
+	srv.SubscriptionService.Mu.Lock()
+	srv.SubscriptionService.Subs[sub.ID] = sub
+	srv.SubscriptionService.Mu.Unlock()
+	defer srv.SubscriptionService.DeleteSubscription(sub.ID)
 
 	itemResp, err := srv.MonitoredItemService.CreateMonitoredItems(nil, &ua.CreateMonitoredItemsRequest{
 		RequestHeader:  &ua.RequestHeader{AuthenticationToken: session.AuthTokenID},
-		SubscriptionID: createSubResp.SubscriptionID,
+		SubscriptionID: sub.ID,
 		ItemsToCreate: []*ua.MonitoredItemCreateRequest{{
 			ItemToMonitor:  &ua.ReadValueID{NodeID: nodeID, AttributeID: ua.AttributeIDValue},
 			MonitoringMode: ua.MonitoringModeReporting,
@@ -53,11 +55,6 @@ func TestMonitoredItemSamplingIntervalCoalescesRapidChanges(t *testing.T) {
 	createItemResp := itemResp.(*ua.CreateMonitoredItemsResponse)
 	if got := createItemResp.Results[0].RevisedSamplingInterval; got != 120 {
 		t.Fatalf("unexpected revised sampling interval %v", got)
-	}
-
-	sub := srv.SubscriptionService.Subs[createSubResp.SubscriptionID]
-	if sub == nil {
-		t.Fatal("expected subscription to exist")
 	}
 
 	if _, err := waitNotification(sub.NotifyChannel, time.Second); err != nil {
