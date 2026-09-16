@@ -116,6 +116,22 @@ outer:
 		}
 	}
 
+	// The receive loop has ended: the client sent CloseSecureChannel (which
+	// the channel surfaces as io.EOF), closed its end of the connection, the
+	// read failed, or the context was cancelled. Part 6 §7.1.5 requires the
+	// server to close the transport connection gracefully when it receives
+	// CloseSecureChannel, and §7.1.4 to release every resource allocated for
+	// the channel; the same applies once the peer is gone. Without this the socket
+	// stays half-open until the runtime finalizer reclaims the unreferenced
+	// net.Conn, which on an idle server takes up to the forced-GC period
+	// (two minutes) and leaks a file descriptor for the same time. Clients
+	// that shut their socket down gracefully and wait for the peer's FIN
+	// stall for that long. Conn.Close is idempotent, so the shutdown path in
+	// channelBroker.Close that also closes channels stays safe.
+	if err := conn.Close(); err != nil && err != io.EOF && c.logger != nil {
+		c.logger.Debug("Secure Channel %d: closing connection: %s", secureChannelID, err)
+	}
+
 	c.mu.Lock()
 	delete(c.s, secureChannelID)
 	c.mu.Unlock()
