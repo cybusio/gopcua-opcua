@@ -136,6 +136,17 @@ func MaxMonitoredItemsQueueSize(n uint32) Option {
 	}
 }
 
+// MaxNotificationsPerPublish sets the largest number of notifications the
+// server sends in one Publish response. A client can ask for fewer with the
+// maxNotificationsPerPublish parameter of its Subscription (Part 4 §5.14.2.2);
+// the notifications that do not fit are sent with the next Publish responses.
+// Zero means no limit. The default is 1000.
+func MaxNotificationsPerPublish(n uint32) Option {
+	return func(s *serverConfig) {
+		s.cap.MaxNotificationsPerPublish = n
+	}
+}
+
 func ServerName(name string) Option {
 	return func(s *serverConfig) {
 		s.applicationName = name

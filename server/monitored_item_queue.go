@@ -1,7 +1,7 @@
 package server
 
 import (
-	"cmp"
+	"container/heap"
 	"slices"
 
 	"github.com/gopcua/opcua/ua"
@@ -25,6 +25,13 @@ const (
 // size of a data MonitoredItem, the default of the
 // ServerCapabilities.MaxMonitoredItemsQueueSize field.
 const defaultMaxMonitoredItemsQueueSize = 5000
+
+// defaultMaxNotificationsPerPublish is the default upper bound for the number
+// of notifications in one Publish response, the default of the
+// ServerCapabilities.MaxNotificationsPerPublish field. It bounds the number of
+// notifications in a response when the client sets no limit or a large one;
+// it does not bound the size in bytes.
+const defaultMaxNotificationsPerPublish = 1000
 
 // revisedQueueSize returns the queue size the server uses for a data
 // MonitoredItem.
@@ -169,33 +176,88 @@ func (s *Subscription) hasQueued() bool {
 	return false
 }
 
-// drainQueues empties the queues of the subscription and returns one
-// MonitoredItemNotification per queued value. The values of each item keep
-// their queue order (Part 4 §5.13.1.5, §7.25.1); across items they are in the
-// order they were sampled, which the spec does not require.
-func (s *Subscription) drainQueues() []*ua.MonitoredItemNotification {
-	type entry struct {
-		seq uint64
-		n   *ua.MonitoredItemNotification
-	}
-
+// drainQueues takes the queued values of the subscription and returns one
+// MonitoredItemNotification per value. The values of each item keep their
+// queue order (Part 4 §5.13.1.5, §7.25.1); across items they are in the order
+// they were sampled, which the spec does not require. At most limit values
+// are taken; a limit of zero takes all of them (§5.14.2.2, Table 82,
+// maxNotificationsPerPublish). The values that do not fit stay queued, and
+// more reports whether any are left (§5.14.1.2; moreNotifications in
+// §5.14.5.2, Table 89).
+func (s *Subscription) drainQueues(limit uint32) (items []*ua.MonitoredItemNotification, more bool) {
 	s.queueMu.Lock()
-	var all []entry
-	for _, q := range s.queues {
-		for _, v := range q.entries {
-			all = append(all, entry{
-				seq: v.seq,
-				n:   &ua.MonitoredItemNotification{ClientHandle: q.clientHandle, Value: v.value},
-			})
-		}
-		q.entries = nil
-	}
-	s.queueMu.Unlock()
+	defer s.queueMu.Unlock()
 
-	slices.SortFunc(all, func(a, b entry) int { return cmp.Compare(a.seq, b.seq) })
-	items := make([]*ua.MonitoredItemNotification, len(all))
-	for i := range all {
-		items[i] = all[i].n
+	// Merge the queues by the sequence number of their oldest value, so that
+	// only the values that are taken are visited.
+	var heads queueHeads
+	var total int
+	for _, q := range s.queues {
+		if len(q.entries) > 0 {
+			heads = append(heads, &queueHead{q: q})
+			total += len(q.entries)
+		}
 	}
-	return items
+	if total == 0 {
+		return nil, false
+	}
+	n := total
+	if limit > 0 && uint64(limit) < uint64(total) {
+		n = int(limit)
+	}
+	touched := slices.Clone(heads)
+	heap.Init(&heads)
+
+	items = make([]*ua.MonitoredItemNotification, 0, n)
+	for len(items) < n {
+		h := heads[0]
+		items = append(items, &ua.MonitoredItemNotification{
+			ClientHandle: h.q.clientHandle,
+			Value:        h.q.entries[h.next].value,
+		})
+		h.next++
+		if h.next == len(h.q.entries) {
+			heap.Pop(&heads)
+		} else {
+			heap.Fix(&heads, 0)
+		}
+	}
+
+	// The values of each queue are in sample order, so the values taken
+	// from a queue are always at its front. Clear them so that the queue
+	// does not keep them alive.
+	for _, h := range touched {
+		switch {
+		case h.next == len(h.q.entries):
+			h.q.entries = nil
+		case h.next > 0:
+			clear(h.q.entries[:h.next])
+			h.q.entries = h.q.entries[h.next:]
+		}
+	}
+	return items, len(heads) > 0
+}
+
+// queueHead points at the oldest value of a queue that drainQueues has not
+// taken yet.
+type queueHead struct {
+	q    *notificationQueue
+	next int
+}
+
+// queueHeads is a min-heap of queues ordered by the sequence number of the
+// value each head points at.
+type queueHeads []*queueHead
+
+func (h queueHeads) Len() int { return len(h) }
+func (h queueHeads) Less(i, j int) bool {
+	return h[i].q.entries[h[i].next].seq < h[j].q.entries[h[j].next].seq
+}
+func (h queueHeads) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *queueHeads) Push(x any)   { *h = append(*h, x.(*queueHead)) }
+func (h *queueHeads) Pop() any {
+	old := *h
+	x := old[len(old)-1]
+	*h = old[:len(old)-1]
+	return x
 }

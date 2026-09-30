@@ -297,9 +297,14 @@ type handleValue struct {
 	value  int32
 }
 
-// drain empties the subscription's queues as a publish response would.
+// drain empties the subscription's queues as a publish response without a
+// notification limit would.
 func (qt *queueTest) drain() []handleValue {
-	return qt.handleValues(qt.sub.drainQueues())
+	items, more := qt.sub.drainQueues(0)
+	if more {
+		qt.t.Errorf("more notifications reported without a limit")
+	}
+	return qt.handleValues(items)
 }
 
 // handleValues returns the client handles and values of notifications and
