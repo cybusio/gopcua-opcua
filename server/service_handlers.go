@@ -6,6 +6,7 @@ package server
 
 import (
 	"context"
+	"runtime/debug"
 	"time"
 
 	"github.com/gopcua/opcua/id"
@@ -101,6 +102,15 @@ func (s *Server) RegisterHandler(typeID uint16, h Handler) {
 }
 
 func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqID uint32, req ua.Request) {
+	// All requests of all secure channels are dispatched from one goroutine,
+	// so a panic in a handler, or while its response is encoded, would stop
+	// the server. Answer that request with Bad_InternalError instead.
+	defer func() {
+		if v := recover(); v != nil {
+			s.answerServicePanic(ctx, sc, reqID, req, v)
+		}
+	}()
+
 	if s.cfg.logger != nil {
 		s.cfg.logger.Debug("handleService: Got: %T\n", req)
 	}
@@ -139,6 +149,38 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			s.cfg.logger.Warn("Error sending response: %s\n", err)
 		}
 	}
+}
+
+// answerServicePanic logs the panic v raised while handling req, with the
+// stack, and answers req with internalErrorFault.
+func (s *Server) answerServicePanic(ctx context.Context, sc *uasc.SecureChannel, reqID uint32, req ua.Request, v any) {
+	defer func() {
+		// Never let the recovery itself stop the dispatch loop.
+		if v := recover(); v != nil && s.cfg.logger != nil {
+			s.cfg.logger.Error("handleService: cannot answer %T after a panic: %v", req, v)
+		}
+	}()
+
+	if s.cfg.logger != nil {
+		s.cfg.logger.Error("handleService: panic while handling %T: %v\n%s", req, v, debug.Stack())
+	}
+	if err := sc.SendResponseWithContext(ctx, reqID, internalErrorFault(req)); err != nil && s.cfg.logger != nil {
+		s.cfg.logger.Warn("Error sending response: %s\n", err)
+	}
+}
+
+// internalErrorFault is the ServiceFault for a request that failed with a
+// panic: Bad_InternalError, "an internal error occurred as a result of a
+// programming or configuration error" (Part 4 §7.38.2 Table 178), with the
+// requestHandle of the request (Part 4 §7.34).
+func internalErrorFault(req ua.Request) *ua.ServiceFault {
+	var handle uint32
+	if req != nil {
+		if hdr := req.Header(); hdr != nil {
+			handle = hdr.RequestHandle
+		}
+	}
+	return &ua.ServiceFault{ResponseHeader: responseHeader(handle, ua.StatusBadInternalError)}
 }
 
 func responseHeader(reqID uint32, statusCode ua.StatusCode) *ua.ResponseHeader {
