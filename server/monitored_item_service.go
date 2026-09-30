@@ -2,6 +2,7 @@ package server
 
 import (
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -52,6 +53,10 @@ func (s *MonitoredItemService) DeleteMonitoredItem(id uint32) {
 	// we've got to go backwards because we're deleting from the slice as we go.
 	// I'm guessing this loop is less efficient than slices.DeleteFunc but it's what we've got.
 	delete(s.Items, id)
+	if item.pendingTimer != nil {
+		item.pendingTimer.Stop()
+		item.pendingTimer = nil
+	}
 	if item.Sub != nil {
 		item.Sub.removeQueue(id)
 	}
@@ -116,9 +121,61 @@ func (s *MonitoredItemService) ChangeNotification(n *ua.NodeID) {
 		if item == nil {
 			continue
 		}
-		s.sampleLocked(item, n)
+		s.queueNotificationLocked(item, n)
 	}
 
+}
+
+// queueNotificationLocked handles a change of the value monitored by item. It
+// samples at once, or defers the sample to the end of the item's current
+// sampling interval. The caller must hold s.Mu.
+func (s *MonitoredItemService) queueNotificationLocked(item *MonitoredItem, nodeID *ua.NodeID) {
+	if item == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+		return
+	}
+
+	// The interval in use is always the one reported to the client.
+	interval := samplingDuration(item.RevisedSamplingInterval)
+	now := time.Now()
+	if interval <= 0 || item.lastSampledAt.IsZero() || now.Sub(item.lastSampledAt) >= interval {
+		s.dispatchNotificationLocked(item, nodeID, now)
+		return
+	}
+
+	if item.pending {
+		return
+	}
+
+	delay := interval - now.Sub(item.lastSampledAt)
+	if delay < 0 {
+		delay = 0
+	}
+	item.pending = true
+	item.pendingTimer = time.AfterFunc(delay, func() {
+		s.firePendingNotification(item.ID)
+	})
+}
+
+func (s *MonitoredItemService) firePendingNotification(id uint32) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	item, ok := s.Items[id]
+	if !ok || item == nil || !item.pending || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+		return
+	}
+
+	s.dispatchNotificationLocked(item, item.Req.ItemToMonitor.NodeID, time.Now())
+}
+
+func (s *MonitoredItemService) dispatchNotificationLocked(item *MonitoredItem, nodeID *ua.NodeID, now time.Time) {
+	if item.pendingTimer != nil {
+		item.pendingTimer.Stop()
+		item.pendingTimer = nil
+	}
+	item.pending = false
+	item.lastSampledAt = now
+	s.sampleLocked(item, nodeID)
 }
 
 // sampleLocked reads the monitored attribute of item and queues the value
@@ -153,6 +210,14 @@ type MonitoredItem struct {
 
 	//TODO: use this
 	Mode ua.MonitoringMode
+
+	// RevisedSamplingInterval is the sampling interval in use for the item,
+	// in milliseconds.
+	RevisedSamplingInterval float64
+
+	lastSampledAt time.Time
+	pending       bool
+	pendingTimer  *time.Timer
 
 	// RevisedQueueSize reports the queue size in use for the item. The
 	// server sets it; changing it does not resize the queue.
@@ -210,10 +275,12 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		}
 		params := itemreq.RequestedParameters
 		item := MonitoredItem{
-			ID:               s.NextID(),
-			Sub:              sub,
-			Req:              itemreq,
-			RevisedQueueSize: revisedQueueSize(params.QueueSize, maxQueueSize),
+			ID:                      s.NextID(),
+			Sub:                     sub,
+			Req:                     itemreq,
+			Mode:                    itemreq.MonitoringMode,
+			RevisedSamplingInterval: revisedSamplingInterval(params, sub.RevisedPublishingInterval),
+			RevisedQueueSize:        revisedQueueSize(params.QueueSize, maxQueueSize),
 		}
 		sub.createQueue(item.ID, params.ClientHandle, item.RevisedQueueSize, params.DiscardOldest)
 
@@ -241,14 +308,14 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		res[i] = &ua.MonitoredItemCreateResult{
 			StatusCode:              ua.StatusOK,
 			MonitoredItemID:         item.ID,
-			RevisedSamplingInterval: sub.RevisedPublishingInterval,
+			RevisedSamplingInterval: item.RevisedSamplingInterval,
 			RevisedQueueSize:        item.RevisedQueueSize,
 			FilterResult:            ua.NewExtensionObject(nil),
 		}
 		// Queue the initial value of the new item (Part 4 §7.25.2) before
 		// responding, which §5.13.2.1 permits. Only this item is sampled:
 		// other items on the same node keep their queues as they are.
-		s.sampleLocked(&item, nodeid)
+		s.queueNotificationLocked(&item, nodeid)
 
 	}
 
@@ -267,6 +334,35 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 
 	return resp, nil
 
+}
+
+// revisedSamplingInterval returns the sampling interval the server uses for
+// a MonitoredItem. Per Part 4 §5.13.1.2 a negative interval requests the
+// publishing interval of the Subscription, and an interval of 0 is kept: the
+// item is exception-based and every change is sampled.
+func revisedSamplingInterval(params *ua.MonitoringParameters, publishingInterval float64) float64 {
+	if params == nil {
+		return defaultSamplingInterval(publishingInterval)
+	}
+	requested := params.SamplingInterval
+	if requested < 0 || math.IsNaN(requested) {
+		return defaultSamplingInterval(publishingInterval)
+	}
+	return requested
+}
+
+func defaultSamplingInterval(publishingInterval float64) float64 {
+	if publishingInterval > 0 {
+		return publishingInterval
+	}
+	return 0
+}
+
+func samplingDuration(interval float64) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(interval * float64(time.Millisecond))
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.3
