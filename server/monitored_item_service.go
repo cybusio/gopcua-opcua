@@ -238,6 +238,9 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if err != nil {
 		return nil, err
 	}
+	if req.TimestampsToReturn > ua.TimestampsToReturnNeither {
+		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTimestampsToReturnInvalid)}, nil
+	}
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
@@ -373,7 +376,69 @@ func (s *MonitoredItemService) ModifyMonitoredItems(sc *uasc.SecureChannel, r ua
 	if err != nil {
 		return nil, err
 	}
-	return serviceUnsupported(req.RequestHeader), nil
+	if len(req.ItemsToModify) == 0 {
+		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadNothingToDo)}, nil
+	}
+	if req.TimestampsToReturn > ua.TimestampsToReturnNeither {
+		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTimestampsToReturnInvalid)}, nil
+	}
+
+	s.SubService.Mu.Lock()
+	sub, ok := s.SubService.Subs[req.SubscriptionID]
+	s.SubService.Mu.Unlock()
+	sess := s.SubService.srv.Session(req.RequestHeader)
+	if !ok || sess == nil || sub.Session == nil || sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
+		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadSubscriptionIDInvalid)}, nil
+	}
+
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	maxQueueSize := s.SubService.srv.cfg.cap.MaxMonitoredItemsQueueSize
+	results := make([]*ua.MonitoredItemModifyResult, len(req.ItemsToModify))
+	for i, itemreq := range req.ItemsToModify {
+		item, ok := s.Items[itemreq.MonitoredItemID]
+		if !ok || item.Sub != sub {
+			results[i] = &ua.MonitoredItemModifyResult{
+				StatusCode:   ua.StatusBadMonitoredItemIDInvalid,
+				FilterResult: ua.NewExtensionObject(nil),
+			}
+			continue
+		}
+		params := itemreq.RequestedParameters
+		if params == nil {
+			params = item.Req.RequestedParameters
+		}
+
+		// Revise the parameters by the same rules as CreateMonitoredItems and
+		// apply them at once, including to the values already queued. An item
+		// whose deletion is still being completed has no queue any more and
+		// is treated as unknown.
+		queueSize := revisedQueueSize(params.QueueSize, maxQueueSize)
+		if !sub.updateQueue(item.ID, params.ClientHandle, queueSize, params.DiscardOldest) {
+			results[i] = &ua.MonitoredItemModifyResult{
+				StatusCode:   ua.StatusBadMonitoredItemIDInvalid,
+				FilterResult: ua.NewExtensionObject(nil),
+			}
+			continue
+		}
+		item.Req.RequestedParameters = params
+		item.RevisedSamplingInterval = revisedSamplingInterval(params, sub.RevisedPublishingInterval)
+		item.RevisedQueueSize = queueSize
+
+		results[i] = &ua.MonitoredItemModifyResult{
+			StatusCode:              ua.StatusOK,
+			RevisedSamplingInterval: item.RevisedSamplingInterval,
+			RevisedQueueSize:        item.RevisedQueueSize,
+			FilterResult:            ua.NewExtensionObject(nil),
+		}
+	}
+
+	return &ua.ModifyMonitoredItemsResponse{
+		ResponseHeader:  responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
+		Results:         results,
+		DiagnosticInfos: []*ua.DiagnosticInfo{},
+	}, nil
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.4

@@ -85,6 +85,49 @@ func (q *notificationQueue) push(v queuedValue) {
 	}
 }
 
+// resize applies new queue parameters. A queue that holds more values than
+// the new size is trimmed following its discard policy (Part 4 §5.13.3.2,
+// Table 66). With discardOldest the newest values are kept. Otherwise the
+// oldest values are kept and the last of them is replaced by the newest
+// value, which is how §7.21 describes discardOldest FALSE for a single new
+// value; the spec does not spell out a trim by more than one.
+//
+// The value that stands in for the discarded ones, the oldest kept one with
+// discardOldest and the newest one otherwise, gets the Overflow bit when the
+// new size is larger than one, as for any value lost from a queue larger than
+// one (§7.25.2, Table 161; §7.38.1, Table 177). Which value carries the bit
+// on a trim is not specified; this follows §5.13.1.5. It also inherits the
+// StructureChanged and SemanticsChanged bits of the discarded values. A queue
+// of size one carries no Overflow bit.
+func (q *notificationQueue) resize(size int, discardOldest bool) {
+	q.size = size
+	q.discardOldest = discardOldest
+
+	if n := len(q.entries); n > max(size, 1) {
+		keep := max(size, 1)
+		var kept []queuedValue
+		if discardOldest || keep == 1 {
+			kept = slices.Clone(q.entries[n-keep:])
+			kept[0].value = withChangedBits(kept[0].value, q.entries[:n-keep]...)
+			if keep > 1 {
+				kept[0].value = withOverflow(kept[0].value)
+			}
+		} else {
+			kept = make([]queuedValue, 0, keep)
+			kept = append(kept, q.entries[:keep-1]...)
+			kept = append(kept, q.entries[n-1])
+			kept[keep-1].value = withOverflow(withChangedBits(kept[keep-1].value, q.entries[keep-1:n-1]...))
+		}
+		q.entries = kept
+	}
+
+	if size <= 1 {
+		for i := range q.entries {
+			q.entries[i].value = withoutOverflow(q.entries[i].value)
+		}
+	}
+}
+
 // withOverflow returns a copy of v with the Overflow info bit set. The rest
 // of the StatusCode, the value and the timestamps are unchanged. v itself is
 // not modified since namespaces may hand out shared DataValues.
@@ -128,6 +171,20 @@ func withChangedBits(v *ua.DataValue, discarded ...queuedValue) *ua.DataValue {
 	return &dv
 }
 
+// withoutOverflow returns a copy of v with the Overflow info bit cleared. The
+// InfoType is reset when no other DataValue info bit remains set.
+func withoutOverflow(v *ua.DataValue) *ua.DataValue {
+	if v == nil || v.Status&statusInfoTypeMask != statusInfoTypeDataValue || v.Status&statusInfoBitOverflow == 0 {
+		return v
+	}
+	dv := *v
+	dv.Status &^= statusInfoBitOverflow
+	if dv.Status&statusInfoBitsMask == 0 {
+		dv.Status &^= statusInfoTypeMask
+	}
+	return &dv
+}
+
 // createQueue creates the queue of a new MonitoredItem with the given id.
 func (s *Subscription) createQueue(id, clientHandle, size uint32, discardOldest bool) {
 	s.queueMu.Lock()
@@ -140,6 +197,21 @@ func (s *Subscription) createQueue(id, clientHandle, size uint32, discardOldest 
 		size:          int(size),
 		discardOldest: discardOldest,
 	}
+}
+
+// updateQueue applies new parameters to the queue of the MonitoredItem with
+// the given id. It reports false if the item has no queue, because it was
+// deleted, and never creates one.
+func (s *Subscription) updateQueue(id, clientHandle, size uint32, discardOldest bool) bool {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	q, ok := s.queues[id]
+	if !ok {
+		return false
+	}
+	q.clientHandle = clientHandle
+	q.resize(int(size), discardOldest)
+	return true
 }
 
 // removeQueue discards the queue of the MonitoredItem with the given id and
