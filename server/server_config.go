@@ -8,6 +8,7 @@ import (
 	"crypto/rsa"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"time"
 
@@ -121,6 +122,17 @@ func defaultChannelConfig() *uasc.Config {
 		SecurityPolicyURI: ua.SecurityPolicyURINone,
 		SecurityMode:      ua.MessageSecurityModeNone,
 		Lifetime:          uint32(time.Hour / time.Millisecond),
+	}
+}
+
+// MaxMonitoredItemsQueueSize sets the largest queue size the server grants to
+// a data MonitoredItem. The server also reports it as
+// ServerCapabilities.MaxMonitoredItemsQueueSize (Part 5 §6.3.2). A value of
+// zero is treated as one, a value above math.MaxInt32 as math.MaxInt32. The
+// default is 5000.
+func MaxMonitoredItemsQueueSize(n uint32) Option {
+	return func(s *serverConfig) {
+		s.cap.MaxMonitoredItemsQueueSize = min(max(n, 1), math.MaxInt32)
 	}
 }
 
