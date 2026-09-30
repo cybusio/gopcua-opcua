@@ -33,6 +33,11 @@ type MonitoredItemService struct {
 func (s *MonitoredItemService) DeleteMonitoredItem(id uint32) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
+	s.deleteMonitoredItemLocked(id)
+}
+
+// deleteMonitoredItemLocked is DeleteMonitoredItem for callers that hold s.Mu.
+func (s *MonitoredItemService) deleteMonitoredItemLocked(id uint32) {
 	item, ok := s.Items[id]
 	if !ok {
 		// id does not exist.
@@ -451,21 +456,21 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 	if err != nil {
 		return nil, err
 	}
+	sub, status := s.subscriptionForItems(req.RequestHeader, req.SubscriptionID, len(req.MonitoredItemIDs))
+	if status != ua.StatusOK {
+		return itemServiceFault(req.RequestHeader, status), nil
+	}
+	// Table 70: the monitoring mode applies to every item of the request.
+	if req.MonitoringMode > ua.MonitoringModeReporting {
+		return itemServiceFault(req.RequestHeader, ua.StatusBadMonitoringModeInvalid), nil
+	}
+
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
 	results := make([]ua.StatusCode, len(req.MonitoredItemIDs))
-
-	sess := s.SubService.srv.Session(req.RequestHeader)
-
-	for i := range req.MonitoredItemIDs {
-		id := req.MonitoredItemIDs[i]
-		item, ok := s.Items[id]
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-			results[i] = ua.StatusBadSessionIDInvalid
-		}
-
+	for i, id := range req.MonitoredItemIDs {
+		item, ok := s.itemOf(sub, id)
 		if !ok {
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
 			continue
@@ -513,30 +518,23 @@ func (s *MonitoredItemService) DeleteMonitoredItems(sc *uasc.SecureChannel, r ua
 		return nil, err
 	}
 
+	sub, status := s.subscriptionForItems(req.RequestHeader, req.SubscriptionID, len(req.MonitoredItemIDs))
+	if status != ua.StatusOK {
+		return itemServiceFault(req.RequestHeader, status), nil
+	}
+
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	sess := s.SubService.srv.Session(req.RequestHeader)
-
 	results := make([]ua.StatusCode, len(req.MonitoredItemIDs))
-	for i := range req.MonitoredItemIDs {
-		id := req.MonitoredItemIDs[i]
-		item, ok := s.Items[id]
-		if !ok {
+	for i, id := range req.MonitoredItemIDs {
+		if _, ok := s.itemOf(sub, id); !ok {
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
+			continue
 		}
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-			results[i] = ua.StatusBadSessionIDInvalid
-		}
-
-		// Discard the queued values now so that no publish response built
-		// after this carries them; one already being sent may (Part 4
-		// §5.13.6.1).
-		item.Sub.removeQueue(id)
-
-		// this function gets the lock so we need to do it in the background so it can happen after our lock is released.
-		go s.DeleteMonitoredItem(id)
+		// Delete before responding, so that a later request for the same
+		// id sees Bad_MonitoredItemIdInvalid.
+		s.deleteMonitoredItemLocked(id)
 		results[i] = ua.StatusOK
 	}
 
@@ -554,4 +552,53 @@ func (s *MonitoredItemService) DeleteMonitoredItems(sc *uasc.SecureChannel, r ua
 	}
 	return response, nil
 
+}
+
+// subscriptionForItems returns the Subscription that qualifies the
+// monitoredItemIds of a SetMonitoringMode or DeleteMonitoredItems request
+// (Part 4 §5.13.4.2, §5.13.6.2). If the request cannot be processed, it
+// returns the service result for the ServiceFault instead (Tables 70, 76 and
+// 178): Bad_SessionIdInvalid if the authenticationToken identifies no Session,
+// Bad_NothingToDo for an empty list, and Bad_SubscriptionIdInvalid if the
+// Subscription does not exist or belongs to another Session.
+func (s *MonitoredItemService) subscriptionForItems(hdr *ua.RequestHeader, subID uint32, count int) (*Subscription, ua.StatusCode) {
+	if hdr == nil || hdr.AuthenticationToken == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	sess := s.SubService.srv.Session(hdr)
+	if sess == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	if count == 0 {
+		return nil, ua.StatusBadNothingToDo
+	}
+	s.SubService.Mu.Lock()
+	sub := s.SubService.Subs[subID]
+	s.SubService.Mu.Unlock()
+	if sub == nil || sub.Session != sess {
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
+	return sub, ua.StatusOK
+}
+
+// itemOf returns the MonitoredItem id if it is one of the items of sub. An id
+// that was never created, was deleted, or belongs to another Subscription is
+// Bad_MonitoredItemIdInvalid for that operation (Part 4 §5.13.4.4 Table 71,
+// §5.13.6.4 Table 77). The caller must hold s.Mu.
+func (s *MonitoredItemService) itemOf(sub *Subscription, id uint32) (*MonitoredItem, bool) {
+	item, ok := s.Items[id]
+	if !ok || item == nil || item.Sub != sub {
+		return nil, false
+	}
+	return item, true
+}
+
+// itemServiceFault answers a request that fails as a whole. Part 4 §7.34: the
+// requestHandle is the one the client sent.
+func itemServiceFault(hdr *ua.RequestHeader, status ua.StatusCode) ua.Response {
+	var handle uint32
+	if hdr != nil {
+		handle = hdr.RequestHandle
+	}
+	return &ua.ServiceFault{ResponseHeader: responseHeader(handle, status)}
 }
