@@ -3,9 +3,9 @@ package server
 import (
 	"crypto/rand"
 	"log"
-	"strings"
 	"time"
 
+	"github.com/gopcua/opcua/id"
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uasc"
 )
@@ -37,6 +37,13 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 	}
 
 	// New session
+	//
+	// Its endpoint descriptions are obtained before it is allocated, so a
+	// failing or panicking GetEndpoints handler leaves no Session behind.
+	endpoints, err := s.serverEndpoints(sc, req, reqID)
+	if err != nil {
+		return nil, err
+	}
 	sess := s.srv.sb.NewSession()
 
 	// Ensure session timeout is reasonable
@@ -59,16 +66,6 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, ua.StatusBadInternalError
 	}
 
-	matching_endpoints := make([]*ua.EndpointDescription, 0)
-	reqTrimmedURL, _ := strings.CutSuffix(req.EndpointURL, "/")
-	for i := range s.srv.endpoints {
-		ep := s.srv.endpoints[i]
-		epTrimmedURL, _ := strings.CutSuffix(ep.EndpointURL, "/")
-		if epTrimmedURL == reqTrimmedURL {
-			matching_endpoints = append(matching_endpoints, ep)
-		}
-	}
-
 	response := &ua.CreateSessionResponse{
 		ResponseHeader:        responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
 		SessionID:             sess.ID,
@@ -81,10 +78,51 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		},
 		ServerCertificate: s.srv.cfg.certificate,
 		ServerNonce:       nonce,
-		ServerEndpoints:   matching_endpoints,
+		ServerEndpoints:   endpoints,
 	}
 
 	return response, nil
+}
+
+// serverEndpoints returns the EndpointDescriptions for the serverEndpoints
+// field of the CreateSession response.
+//
+// A Client that selected its security options from GetEndpoints verifies
+// serverEndpoints against that list and closes the Session if they differ
+// (Part 4 v1.05.07 §5.7.2.1 and §5.7.2.2; §5.6.2 in earlier 1.05
+// editions). Both lists must therefore describe the endpoints identically.
+// They are taken from the GetEndpoints handler, the default one or a
+// replacement installed with RegisterHandler, asked with the EndpointUrl of
+// the CreateSession request.
+func (s *SessionService) serverEndpoints(sc *uasc.SecureChannel, req *ua.CreateSessionRequest, reqID uint32) ([]*ua.EndpointDescription, error) {
+	h, ok := s.srv.handlers[id.GetEndpointsRequest_Encoding_DefaultBinary]
+	if !ok {
+		h = (&DiscoveryService{s.srv}).GetEndpoints
+	}
+	hdr := &ua.RequestHeader{}
+	if req.RequestHeader != nil {
+		*hdr = *req.RequestHeader
+	}
+	resp, err := h(sc, &ua.GetEndpointsRequest{
+		RequestHeader: hdr,
+		EndpointURL:   req.EndpointURL,
+	}, reqID)
+	if err != nil {
+		return nil, err
+	}
+	gr, ok := resp.(*ua.GetEndpointsResponse)
+	if !ok {
+		if s.srv.cfg.logger != nil {
+			s.srv.cfg.logger.Warn("GetEndpoints handler returned %T, want *ua.GetEndpointsResponse", resp)
+		}
+		return nil, ua.StatusBadInternalError
+	}
+	// A ServiceResult with Bad severity (top bit set) is a failure even
+	// when it arrives in a GetEndpointsResponse.
+	if gr.ResponseHeader != nil && uint32(gr.ResponseHeader.ServiceResult)&0x80000000 != 0 {
+		return nil, gr.ResponseHeader.ServiceResult
+	}
+	return gr.Endpoints, nil
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.6.3
