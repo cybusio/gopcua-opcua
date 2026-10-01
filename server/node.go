@@ -294,6 +294,22 @@ func (n *Node) DataType() *ua.ExpandedNodeID {
 	}
 }
 
+// typeDefinition returns the target of the node's forward HasTypeDefinition
+// reference, which a ReferenceDescription reports as the type definition of
+// its TargetNode (Part 4 7.29). A node without one falls back to DataType,
+// which holds the type definition of nodes that carry no references.
+func (n *Node) typeDefinition() *ua.ExpandedNodeID {
+	if n == nil {
+		return ua.NewTwoByteExpandedNodeID(0)
+	}
+	for _, r := range n.refs {
+		if r.IsForward && r.NodeID != nil && r.ReferenceTypeID != nil && r.ReferenceTypeID.IntID() == id.HasTypeDefinition {
+			return r.NodeID
+		}
+	}
+	return n.DataType()
+}
+
 func (n *Node) SetNodeClass(nc ua.NodeClass) {
 	n.attr[ua.AttributeIDNodeClass] = DataValueFromValue(uint32(nc))
 }
