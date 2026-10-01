@@ -17,6 +17,23 @@ type SubscriptionService struct {
 	// pub sub stuff
 	Mu   sync.Mutex
 	Subs map[uint32]*Subscription
+
+	// lastID is the last subscription id handed out. It is guarded by Mu.
+	lastID uint32
+}
+
+// nextID returns the next subscription id. Ids are unique for the entire
+// server, not just for the session (Part 4 §5.14.2.2, Table 82), and an
+// IntegerId is never 0 (Part 4 §7.19). The ids increase monotonically, so
+// the id of a deleted subscription is not handed out again until the counter
+// wraps; an id still in use is skipped. s.Mu must be held.
+func (s *SubscriptionService) nextID() uint32 {
+	for {
+		s.lastID++
+		if s.lastID != 0 && s.Subs[s.lastID] == nil {
+			return s.lastID
+		}
+	}
 }
 
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
@@ -55,7 +72,7 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	newsubid := uint32(len(s.Subs)) + 1
+	newsubid := s.nextID()
 
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Info("New Sub %d for %v", newsubid, sc.RemoteAddr())
