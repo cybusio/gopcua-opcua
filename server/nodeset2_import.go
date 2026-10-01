@@ -21,7 +21,104 @@ func (srv *Server) ImportNodeSet(nodes *schema.UANodeSet) error {
 	if err != nil {
 		return fmt.Errorf("problem creating references: %w", err)
 	}
+	srv.uniqueImportedRefs(nodes)
 	return nil
+}
+
+// importedRefKey identifies a reference of one node by its ReferenceType,
+// direction and TargetNode. Numeric NodeIds, which nearly all references of
+// a nodeset use, are keyed without formatting them.
+type importedRefKey struct {
+	refTypeNS, targetNS   uint16
+	refType, target       uint32
+	refTypeStr, targetStr string
+	forward               bool
+}
+
+func newImportedRefKey(r *ua.ReferenceDescription) (importedRefKey, bool) {
+	if r.ReferenceTypeID == nil || r.NodeID == nil || r.NodeID.NodeID == nil {
+		return importedRefKey{}, false
+	}
+	k := importedRefKey{
+		refTypeNS: r.ReferenceTypeID.Namespace(),
+		targetNS:  r.NodeID.NodeID.Namespace(),
+		forward:   r.IsForward,
+	}
+	if numericNodeID(r.ReferenceTypeID) {
+		k.refType = r.ReferenceTypeID.IntID()
+	} else {
+		k.refTypeStr = r.ReferenceTypeID.String()
+	}
+	if numericNodeID(r.NodeID.NodeID) {
+		k.target = r.NodeID.NodeID.IntID()
+	} else {
+		k.targetStr = r.NodeID.NodeID.String()
+	}
+	return k, true
+}
+
+func numericNodeID(n *ua.NodeID) bool {
+	switch n.Type() {
+	case ua.NodeIDTypeTwoByte, ua.NodeIDTypeFourByte, ua.NodeIDTypeNumeric:
+		return true
+	}
+	return false
+}
+
+// uniqueImportedRefs removes the duplicate references refsImportNodeSet
+// leaves on the nodes of the nodeset. A Reference is identified by its
+// SourceNode, ReferenceType and TargetNode, so a node references another
+// node with the same ReferenceType only once (Part 3 4.3.4).
+// refsImportNodeSet adds both ends of every reference a node declares, and
+// a nodeset usually declares a reference on both of its nodes, so without
+// this pass both nodes hold such a reference twice. The first occurrence is
+// kept, so the order of the references is unchanged.
+func (srv *Server) uniqueImportedRefs(nodes *schema.UANodeSet) {
+	seen := make(map[importedRefKey]bool)
+	unique := func(nodeID string) {
+		nid, err := ua.ParseNodeID(nodeID)
+		if err != nil {
+			return
+		}
+		n := srv.Node(nid)
+		if n == nil || len(n.refs) < 2 {
+			return
+		}
+		clear(seen)
+		refs := n.refs[:0]
+		for _, r := range n.refs {
+			if k, ok := newImportedRefKey(r); ok {
+				if seen[k] {
+					continue
+				}
+				seen[k] = true
+			}
+			refs = append(refs, r)
+		}
+		clear(n.refs[len(refs):])
+		n.refs = refs
+	}
+	for _, x := range nodes.UAReferenceType {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UADataType {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UAObjectType {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UAVariableType {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UAVariable {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UAMethod {
+		unique(x.NodeIdAttr)
+	}
+	for _, x := range nodes.UAObject {
+		unique(x.NodeIdAttr)
+	}
 }
 
 func (srv *Server) namespacesImportNodeSet(nodes *schema.UANodeSet) error {
