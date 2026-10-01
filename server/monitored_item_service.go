@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"math"
 	"slices"
 	"sync"
@@ -235,6 +234,46 @@ type MonitoredItem struct {
 	RevisedQueueSize uint32
 }
 
+// subscriptionForCreate returns the Subscription that a CreateMonitoredItems
+// request adds its items to. If the request cannot be processed as a whole,
+// it returns the service result for a ServiceFault instead (Part 4 §5.13.2.3
+// Table 64 and §7.38.2 Table 178), checked in this order:
+// Bad_SessionIdInvalid if the authenticationToken identifies no Session,
+// Bad_SubscriptionIdInvalid if subscriptionId identifies no Subscription or
+// a Subscription of another Session (§5.14.1: a Subscription belongs to the
+// Session that created it), and Bad_NothingToDo for an empty itemsToCreate.
+func (s *MonitoredItemService) subscriptionForCreate(req *ua.CreateMonitoredItemsRequest) (*Subscription, ua.StatusCode) {
+	hdr := req.RequestHeader
+	if hdr == nil || hdr.AuthenticationToken == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	sess := s.SubService.srv.Session(hdr)
+	if sess == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	s.SubService.Mu.Lock()
+	sub := s.SubService.Subs[req.SubscriptionID]
+	s.SubService.Mu.Unlock()
+	if sub == nil || sub.Session != sess {
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
+	if len(req.ItemsToCreate) == 0 {
+		return nil, ua.StatusBadNothingToDo
+	}
+	return sub, ua.StatusOK
+}
+
+// createServiceFault answers a CreateMonitoredItems request that fails as a
+// whole. Part 4 §7.34: the ServiceFault carries the requestHandle the client
+// sent.
+func createServiceFault(hdr *ua.RequestHeader, status ua.StatusCode) ua.Response {
+	var handle uint32
+	if hdr != nil {
+		handle = hdr.RequestHandle
+	}
+	return &ua.ServiceFault{ResponseHeader: responseHeader(handle, status)}
+}
+
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
 // TODO: per-item results are never validated; every item is accepted with
 // StatusOK whether or not the node exists. Part 4 §5.13.2.4 (Table 65) defines
@@ -264,16 +303,9 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if s.SubService.srv.cfg.logger != nil {
 		s.SubService.srv.cfg.logger.Debug("Creating monitored items for sub #%d", subID)
 	}
-	s.SubService.Mu.Lock()
-	sub, ok := s.SubService.Subs[subID]
-	s.SubService.Mu.Unlock()
-	if !ok {
-		return nil, errors.New("sub doesn't exist")
-	}
-
-	sess := s.SubService.srv.Session(req.RequestHeader)
-	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-		return nil, errors.New("not your subscription, bro")
+	sub, status := s.subscriptionForCreate(req)
+	if status != ua.StatusOK {
+		return createServiceFault(req.RequestHeader, status), nil
 	}
 
 	maxQueueSize := s.SubService.srv.cfg.cap.MaxMonitoredItemsQueueSize
