@@ -158,6 +158,35 @@ func checkStatuses(t *testing.T, q *notificationQueue, want []int32, status []ua
 	}
 }
 
+// Part 4 §7.38.1, Table 176: the Overflow bit is set only where the InfoType
+// gives the info bits a meaning. Other DataValue info bits are kept, info bits
+// of an InfoType NotUsed are cleared, and a reserved InfoType is left as it is.
+func TestWithOverflowInfoType(t *testing.T) {
+	const otherInfoBit ua.StatusCode = 0x00000001
+	for _, tt := range []struct {
+		name       string
+		status     ua.StatusCode
+		want       ua.StatusCode
+		sameAsSent bool
+	}{
+		{"not used", ua.StatusOK, statusGoodOverflow, false},
+		{"not used, stray info bits", otherInfoBit, statusGoodOverflow, false},
+		{"data value, other info bit", statusInfoTypeDataValue | otherInfoBit, statusGoodOverflow | otherInfoBit, false},
+		{"reserved", 0x00000800 | otherInfoBit, 0x00000800 | otherInfoBit, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &ua.DataValue{EncodingMask: ua.DataValueStatusCode, Status: tt.status}
+			got := withOverflow(v)
+			if got.Status != tt.want {
+				t.Fatalf("got status 0x%08X, want 0x%08X", uint32(got.Status), uint32(tt.want))
+			}
+			if (got == v) != tt.sameAsSent {
+				t.Fatalf("returned the given DataValue: %v, want %v", got == v, tt.sameAsSent)
+			}
+		})
+	}
+}
+
 // Part 4 §7.38.1, Table 176: when a value with StructureChanged or
 // SemanticsChanged set is discarded, the next value in the queue gets the bit.
 func TestNotificationQueueCarriesChangedBits(t *testing.T) {
@@ -182,6 +211,11 @@ func TestNotificationQueueCarriesChangedBits(t *testing.T) {
 			q.push(v)
 		}
 		checkStatuses(t, q, []int32{2}, []ua.StatusCode{semanticsChanged})
+		// The value had no StatusCode in its encoding mask; the inherited
+		// bit is only sent if the mask now has one.
+		if !q.entries[0].value.Has(ua.DataValueStatusCode) {
+			t.Fatal("inherited bit not in the encoding mask")
+		}
 		if vs[1].value.Status != 0 {
 			t.Fatalf("source DataValue was modified: status 0x%08X", uint32(vs[1].value.Status))
 		}
@@ -402,6 +436,20 @@ func TestCreateMonitoredItemsWithoutParameters(t *testing.T) {
 		t.Fatalf("got revisedQueueSize %d, want 1", item.RevisedQueueSize)
 	}
 	qt.expect(qt.drain(), handleValue{0, 0})
+}
+
+// DeleteMonitoredItem, which also deletes the items of a deleted
+// Subscription, removes the item's queue.
+func TestDeleteMonitoredItemRemovesQueue(t *testing.T) {
+	qt := newQueueTest(t)
+	item := qt.create(qt.node("value"), 1, 10, true)
+	qt.srv.MonitoredItemService.DeleteMonitoredItem(item.MonitoredItemID)
+	qt.sub.queueMu.Lock()
+	_, ok := qt.sub.queues[item.MonitoredItemID]
+	qt.sub.queueMu.Unlock()
+	if ok {
+		t.Fatal("queue of the deleted item still exists")
+	}
 }
 
 // Deleted items lose their queued values at once.

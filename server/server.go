@@ -141,7 +141,8 @@ type ServerCapabilities struct {
 
 	// MaxNotificationsPerPublish is the largest number of notifications the
 	// server sends in one Publish response, whatever the client allows.
-	// Zero means no limit. It is not part of the address space. Set it with
+	// Zero means no limit. Part 5 defines no standard capability for it, and
+	// the server does not expose it in the address space. Set it with
 	// the MaxNotificationsPerPublish option.
 	MaxNotificationsPerPublish uint32
 }
@@ -235,13 +236,13 @@ func New(opts ...Option) *Server {
 	}
 	s.ImportNodeSet(nodes)
 
-	s.namespaces[0].AddNode(CurrentTimeNode())
-	s.namespaces[0].AddNode(NamespacesNode(s))
+	s.addServerNode(CurrentTimeNode())
+	s.addServerNode(NamespacesNode(s))
 	for _, n := range ServerStatusNodes(s, s.namespaces[0].Node(ua.NewNumericNodeID(0, id.Server))) {
-		s.namespaces[0].AddNode(n)
+		s.addServerNode(n)
 	}
 	for _, n := range ServerCapabilitiesNodes(s) {
-		s.namespaces[0].AddNode(n)
+		s.addServerNode(n)
 	}
 
 	return s

@@ -57,7 +57,9 @@ func TestDrainQueuesHonorsMaxNotificationsPerPublish(t *testing.T) {
 }
 
 // A limit that does not fit in an int32 takes every value. On 32-bit
-// platforms a signed comparison would slice out of range and panic.
+// platforms, converting such a limit to int would make it negative; the limit
+// is compared as uint64. (CI runs no 32-bit job; GOARCH=386 go vet checks the
+// build.)
 func TestDrainQueuesLargeLimit(t *testing.T) {
 	qt := newQueueTest(t)
 	nodeID := qt.node("value")
@@ -75,6 +77,9 @@ func TestDrainQueuesLargeLimit(t *testing.T) {
 // The limit for a publish response is the smaller of the client's and the
 // server's, where zero means no limit.
 func TestNotificationLimit(t *testing.T) {
+	// This changes the configuration of the shared server and restores it.
+	// That is safe because the queue tests do not run in parallel and no
+	// publish loop runs on the shared server.
 	qt := newQueueTest(t)
 	saved := qt.srv.cfg.cap
 	t.Cleanup(func() { qt.srv.cfg.cap = saved })
@@ -194,5 +199,119 @@ func BenchmarkDrainQueues(b *testing.B) {
 		for id := uint32(1); id <= items; id++ {
 			s.enqueue(id, int32Value(int32(i)))
 		}
+	}
+}
+
+// publishTest runs the publish loop of a subscription on a server of its own,
+// so that the loop never shares a server with other tests, and records what it
+// sends.
+type publishTest struct {
+	*queueTest
+	responses chan publishSent
+}
+
+type publishSent struct {
+	reqID uint32
+	resp  *ua.PublishResponse
+	at    time.Time
+}
+
+func newPublishTest(t *testing.T, interval time.Duration, maxKeepAliveCount uint32) *publishTest {
+	t.Helper()
+	pt := &publishTest{
+		// Passing an option gives the test a server of its own, so that its
+		// publish loop never reads the configuration of the shared server.
+		queueTest: newQueueTest(t, MaxNotificationsPerPublish(defaultMaxNotificationsPerPublish)),
+		responses: make(chan publishSent, 10),
+	}
+	sub := pt.sub
+	sub.RevisedPublishingInterval = float64(interval / time.Millisecond)
+	sub.RevisedLifetimeCount = 1000
+	sub.RevisedMaxKeepAliveCount = maxKeepAliveCount
+	sub.send = func(reqID uint32, resp ua.Response) error {
+		pt.responses <- publishSent{reqID, resp.(*ua.PublishResponse), time.Now()}
+		return nil
+	}
+	return pt
+}
+
+func (pt *publishTest) start() {
+	pt.sub.Mu.Lock()
+	pt.sub.running = true
+	pt.sub.Mu.Unlock()
+	pt.sub.Start()
+}
+
+func (pt *publishTest) publish(id uint32) {
+	pt.sess.PublishRequests <- PubReq{
+		Req: &ua.PublishRequest{RequestHeader: &ua.RequestHeader{RequestHandle: id}},
+		ID:  id,
+	}
+}
+
+func (pt *publishTest) next(timeout time.Duration) publishSent {
+	pt.t.Helper()
+	select {
+	case s := <-pt.responses:
+		return s
+	case <-time.After(timeout):
+		pt.t.Fatal("no publish response")
+		return publishSent{}
+	}
+}
+
+// Once a NotificationMessage has been sent, a subscription without queued
+// values answers a Publish request with a keep-alive only after
+// maxKeepAliveCount publishing intervals without notifications (Part 4
+// §5.14.1.1, Table 82). The test checks that it does not come early, not the
+// exact interval: the server sends it one interval after the count (the spec
+// says on the count-th expiry). When the items that held the queued values
+// are deleted before the request arrives, the request is answered with a
+// keep-alive, an empty NotificationMessage (§5.14.1.2, Table 79 row 11;
+// §5.14.1.4, Table 81), not with a NotificationMessage that carries an empty
+// DataChangeNotification.
+func TestSubscriptionKeepAlive(t *testing.T) {
+	const interval = 100 * time.Millisecond
+	pt := newPublishTest(t, interval, 3)
+
+	// Send one NotificationMessage first, so that the keep-alive below is
+	// the steady-state one. The first-cycle keep-alive of a new subscription
+	// (§5.14.1.1) is not covered here.
+	pt.create(pt.node("a"), 1, 10, true)
+	pt.publish(1)
+	pt.start()
+	first := pt.next(20 * interval)
+	if n := len(first.resp.NotificationMessage.NotificationData); n != 1 {
+		t.Fatalf("first response carries %d notifications, want the initial value", n)
+	}
+
+	pt.publish(2)
+	s := pt.next(20 * interval)
+	if d := s.at.Sub(first.at); d < 2*interval {
+		t.Fatalf("keep-alive %v after the last NotificationMessage, want at least %v", d, 2*interval)
+	}
+	if n := len(s.resp.NotificationMessage.NotificationData); n != 0 {
+		t.Fatalf("keep-alive carries %d notifications", n)
+	}
+
+	// Queue a value and give the loop time to wait for a Publish request, then
+	// delete the item and send the request.
+	item := pt.create(pt.node("b"), 2, 10, true)
+	time.Sleep(3 * interval)
+	_, err := pt.srv.MonitoredItemService.DeleteMonitoredItems(nil, &ua.DeleteMonitoredItemsRequest{
+		RequestHeader:    pt.header(),
+		SubscriptionID:   pt.sub.ID,
+		MonitoredItemIDs: []uint32{item.MonitoredItemID},
+	}, 0)
+	if err != nil {
+		t.Fatalf("DeleteMonitoredItems: %v", err)
+	}
+	pt.publish(3)
+	s = pt.next(20 * interval)
+	if s.reqID != 3 {
+		t.Fatalf("response to request %d, want 3", s.reqID)
+	}
+	if n := len(s.resp.NotificationMessage.NotificationData); n != 0 {
+		t.Fatalf("response carries %d notifications, want a keep-alive", n)
 	}
 }
