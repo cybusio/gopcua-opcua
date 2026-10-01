@@ -133,6 +133,10 @@ func (s *MonitoredItemService) queueNotificationLocked(item *MonitoredItem, node
 	if item == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
 		return
 	}
+	// A disabled item is not sampled (Part 4 §5.13.1.3).
+	if item.Mode == ua.MonitoringModeDisabled {
+		return
+	}
 
 	// The interval in use is always the one reported to the client.
 	interval := samplingDuration(item.RevisedSamplingInterval)
@@ -161,7 +165,7 @@ func (s *MonitoredItemService) firePendingNotification(id uint32) {
 	defer s.Mu.Unlock()
 
 	item, ok := s.Items[id]
-	if !ok || item == nil || !item.pending || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+	if !ok || item == nil || !item.pending || item.Mode == ua.MonitoringModeDisabled || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
 		return
 	}
 
@@ -208,7 +212,9 @@ type MonitoredItem struct {
 	Sub *Subscription
 	Req *ua.MonitoredItemCreateRequest
 
-	//TODO: use this
+	// Mode is the MonitoringMode of the item (Part 4 §5.13.1.3). A disabled
+	// item is not sampled; a sampling item queues its values without
+	// reporting them. Use SetMonitoringMode to change it.
 	Mode ua.MonitoringMode
 
 	// RevisedSamplingInterval is the sampling interval in use for the item,
@@ -285,7 +291,7 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 			RevisedSamplingInterval: revisedSamplingInterval(params, sub.RevisedPublishingInterval),
 			RevisedQueueSize:        revisedQueueSize(params.QueueSize, maxQueueSize),
 		}
-		sub.createQueue(item.ID, params.ClientHandle, item.RevisedQueueSize, params.DiscardOldest)
+		sub.createQueue(item.ID, params.ClientHandle, item.RevisedQueueSize, params.DiscardOldest, item.Mode)
 
 		// book keeping of the new item
 		s.Items[item.ID] = &item
@@ -472,7 +478,7 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
 			continue
 		}
-		item.Mode = req.MonitoringMode
+		s.setMonitoringModeLocked(item, req.MonitoringMode)
 		results[i] = ua.StatusOK
 	}
 
@@ -489,6 +495,43 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 		DiagnosticInfos: []*ua.DiagnosticInfo{},
 	}, nil
 
+}
+
+// setMonitoringModeLocked changes the MonitoringMode of item. The caller must
+// hold s.Mu.
+//
+// Part 4 §5.13.1.3: a disabled item is neither sampled nor reported, a
+// sampling item is sampled and its values are queued but not reported, and a
+// reporting item is sampled and reported. When an item is enabled, its first
+// sample is taken as soon as possible, whether or not the value changed while
+// it was disabled. §5.13.4.1: setting the mode to Disabled deletes all queued
+// values of the item. Setting the mode the item already has changes nothing.
+// §7.23 defines the three modes; any other value is treated as Reporting.
+func (s *MonitoredItemService) setMonitoringModeLocked(item *MonitoredItem, mode ua.MonitoringMode) {
+	prev := item.Mode
+	if mode == prev {
+		return
+	}
+	item.Mode = mode
+	if item.Sub != nil {
+		item.Sub.setQueueMode(item.ID, mode)
+	}
+
+	switch {
+	case mode == ua.MonitoringModeDisabled:
+		// Stop sampling: drop a sample deferred to the end of the
+		// sampling interval.
+		if item.pendingTimer != nil {
+			item.pendingTimer.Stop()
+			item.pendingTimer = nil
+		}
+		item.pending = false
+	case prev == ua.MonitoringModeDisabled:
+		if item.Sub == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+			return
+		}
+		s.dispatchNotificationLocked(item, item.Req.ItemToMonitor.NodeID, time.Now())
+	}
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.5
