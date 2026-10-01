@@ -60,6 +60,23 @@ type notificationQueue struct {
 	size          int
 	discardOldest bool
 	entries       []queuedValue
+
+	// held is set while the MonitoringMode of the item is not Reporting:
+	// its values stay queued and are not published (Part 4 §5.13.1.3).
+	held bool
+}
+
+// setMode applies the MonitoringMode of the item to its queue. Part 4
+// §5.13.1.3: only a reporting item publishes its queued values; a sampling
+// item keeps them queued. §5.13.4.1: setting the mode to Disabled deletes all
+// queued values. A value outside the enumeration (§7.23) is treated as
+// Reporting.
+func (q *notificationQueue) setMode(mode ua.MonitoringMode) {
+	q.held = mode == ua.MonitoringModeDisabled || mode == ua.MonitoringModeSampling
+	if mode == ua.MonitoringModeDisabled {
+		clear(q.entries)
+		q.entries = nil
+	}
 }
 
 // push queues v according to the size and discard policy of the queue
@@ -187,17 +204,30 @@ func withoutOverflow(v *ua.DataValue) *ua.DataValue {
 	return &dv
 }
 
-// createQueue creates the queue of a new MonitoredItem with the given id.
-func (s *Subscription) createQueue(id, clientHandle, size uint32, discardOldest bool) {
+// createQueue creates the queue of a new MonitoredItem with the given id and
+// MonitoringMode.
+func (s *Subscription) createQueue(id, clientHandle, size uint32, discardOldest bool, mode ua.MonitoringMode) {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	if s.queues == nil {
 		s.queues = map[uint32]*notificationQueue{}
 	}
-	s.queues[id] = &notificationQueue{
+	q := &notificationQueue{
 		clientHandle:  clientHandle,
 		size:          int(size),
 		discardOldest: discardOldest,
+	}
+	q.setMode(mode)
+	s.queues[id] = q
+}
+
+// setQueueMode applies a new MonitoringMode to the queue of the MonitoredItem
+// with the given id. It does nothing if the item has no queue.
+func (s *Subscription) setQueueMode(id uint32, mode ua.MonitoringMode) {
+	s.queueMu.Lock()
+	defer s.queueMu.Unlock()
+	if q, ok := s.queues[id]; ok {
+		q.setMode(mode)
 	}
 }
 
@@ -238,12 +268,13 @@ func (s *Subscription) enqueue(id uint32, v *ua.DataValue) {
 }
 
 // hasQueued reports whether any MonitoredItem of the subscription has a
-// value waiting to be published.
+// value waiting to be published. Values held by an item that is not
+// reporting do not count.
 func (s *Subscription) hasQueued() bool {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	for _, q := range s.queues {
-		if len(q.entries) > 0 {
+		if !q.held && len(q.entries) > 0 {
 			return true
 		}
 	}
@@ -257,7 +288,8 @@ func (s *Subscription) hasQueued() bool {
 // are taken; a limit of zero takes all of them (§5.14.2.2, Table 82,
 // maxNotificationsPerPublish). The values that do not fit stay queued, and
 // more reports whether any are left (§5.14.1.2; moreNotifications in
-// §5.14.5.2, Table 89).
+// §5.14.5.2, Table 89). The queues of items that are not reporting are left
+// as they are (§5.13.1.3).
 func (s *Subscription) drainQueues(limit uint32) (items []*ua.MonitoredItemNotification, more bool) {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
@@ -267,7 +299,7 @@ func (s *Subscription) drainQueues(limit uint32) (items []*ua.MonitoredItemNotif
 	var heads queueHeads
 	var total int
 	for _, q := range s.queues {
-		if len(q.entries) > 0 {
+		if !q.held && len(q.entries) > 0 {
 			heads = append(heads, &queueHead{q: q})
 			total += len(q.entries)
 		}
