@@ -157,13 +157,13 @@ func New(opts ...Option) *Server {
 	}
 	s.ImportNodeSet(&nodes)
 
-	s.namespaces[0].AddNode(CurrentTimeNode())
-	s.namespaces[0].AddNode(NamespacesNode(s))
+	s.addServerNode(CurrentTimeNode())
+	s.addServerNode(NamespacesNode(s))
 	for _, n := range ServerStatusNodes(s, s.namespaces[0].Node(ua.NewNumericNodeID(0, id.Server))) {
-		s.namespaces[0].AddNode(n)
+		s.addServerNode(n)
 	}
 	for _, n := range ServerCapabilitiesNodes(s) {
-		s.namespaces[0].AddNode(n)
+		s.addServerNode(n)
 	}
 
 	return s
