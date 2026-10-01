@@ -14,6 +14,12 @@ import (
 // MonitoredItemService implements the MonitoredItem Service Set.
 //
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13
+//
+// Lock order: a goroutine that holds both SubService.Mu and Mu takes
+// SubService.Mu first. Mu is never held while acquiring SubService.Mu:
+// SubscriptionService.DeleteSubscription holds SubService.Mu while it calls
+// DeleteSub, which takes Mu. A Subscription's own locks are taken last: no
+// other lock is acquired while one is held.
 type MonitoredItemService struct {
 	SubService *SubscriptionService
 	Mu         sync.Mutex
@@ -166,6 +172,12 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if err != nil {
 		return nil, err
 	}
+	// SubService.Mu is taken before s.Mu (see the lock order on
+	// MonitoredItemService) and held until the items are created, so the
+	// subscription cannot be deleted between the lookup and the creation of
+	// its items.
+	s.SubService.Mu.Lock()
+	defer s.SubService.Mu.Unlock()
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
@@ -177,9 +189,7 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if s.SubService.srv.cfg.logger != nil {
 		s.SubService.srv.cfg.logger.Debug("Creating monitored items for sub #%d", subID)
 	}
-	s.SubService.Mu.Lock()
 	sub, ok := s.SubService.Subs[subID]
-	s.SubService.Mu.Unlock()
 	if !ok {
 		return nil, errors.New("sub doesn't exist")
 	}
