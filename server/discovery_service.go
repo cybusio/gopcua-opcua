@@ -59,11 +59,10 @@ func (s *DiscoveryService) GetEndpoints(sc *uasc.SecureChannel, r ua.Request, re
 		return nil, err
 	}
 
-	requrl := strings.ToLower(req.EndpointURL)
 	matching_endpoints := make([]*ua.EndpointDescription, 0)
 	for i := range s.srv.endpoints {
 		ep := s.srv.endpoints[i]
-		if strings.ToLower(ep.EndpointURL) == requrl {
+		if endpointURLMatches(ep.EndpointURL, req.EndpointURL) {
 			matching_endpoints = append(matching_endpoints, ep)
 		}
 	}
@@ -74,6 +73,15 @@ func (s *DiscoveryService) GetEndpoints(sc *uasc.SecureChannel, r ua.Request, re
 	}
 
 	return response, nil
+}
+
+// endpointURLMatches reports whether an endpoint's EndpointUrl matches the
+// EndpointUrl a client sent in a GetEndpoints request. The comparison ignores
+// case and a single trailing slash on either side.
+func endpointURLMatches(endpointURL, requestURL string) bool {
+	endpointURL, _ = strings.CutSuffix(endpointURL, "/")
+	requestURL, _ = strings.CutSuffix(requestURL, "/")
+	return strings.EqualFold(endpointURL, requestURL)
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.4.5

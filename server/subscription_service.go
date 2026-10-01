@@ -17,6 +17,23 @@ type SubscriptionService struct {
 	// pub sub stuff
 	Mu   sync.Mutex
 	Subs map[uint32]*Subscription
+
+	// lastID is the last subscription id handed out. It is guarded by Mu.
+	lastID uint32
+}
+
+// nextID returns the next subscription id. Ids are unique for the entire
+// server, not just for the session (Part 4 §5.14.2.2, Table 82), and an
+// IntegerId is never 0 (Part 4 §7.19). The ids increase monotonically, so
+// the id of a deleted subscription is not handed out again until the counter
+// wraps; an id still in use is skipped. s.Mu must be held.
+func (s *SubscriptionService) nextID() uint32 {
+	for {
+		s.lastID++
+		if s.lastID != 0 && s.Subs[s.lastID] == nil {
+			return s.lastID
+		}
+	}
 }
 
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
@@ -36,7 +53,9 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 
 	delete(s.Subs, id)
 
-	// ask the monitored item service to purge out any items that use this subscription
+	// ask the monitored item service to purge out any items that use this subscription.
+	// s.Mu stays held, so DeleteSub takes MonitoredItemService.Mu inside it
+	// (see the lock order on MonitoredItemService).
 	s.srv.MonitoredItemService.DeleteSub(id)
 
 }
@@ -55,7 +74,7 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	newsubid := uint32(len(s.Subs)) + 1
+	newsubid := s.nextID()
 
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Info("New Sub %d for %v", newsubid, sc.RemoteAddr())
@@ -260,8 +279,8 @@ type PubReq struct {
 // This is the type that with its run() function will work in the bakground fullfilling subscription
 // publishes.
 //
-// MonitoredItems queue their sampled values in the subscription (see enqueue). Each MonitoredItem
-// has its own queue; the background task sends the queued values with the next publish responses.
+// MonitoredItems queue their sampled values in the subscription. Each MonitoredItem has its own
+// queue; the background task sends the queued values with the next publish responses.
 type Subscription struct {
 	srv                       *SubscriptionService
 	Session                   *session
@@ -400,7 +419,7 @@ func (s *Subscription) run() {
 	//
 	// When a publish response could not carry every queued notification (more is set), the rest is sent
 	// with the next publish request without waiting for the interval, so we skip L0 (Part 4 §5.14.1.2,
-	// Table 79: a Publish request received while MoreNotifications is TRUE returns notifications;
+	// Table 79 rows 5 and 10: a Publish request received while MoreNotifications is TRUE returns notifications;
 	// §5.14.1.4 Table 81, ReturnNotifications).
 	more := false
 	for {
@@ -474,7 +493,9 @@ func (s *Subscription) run() {
 		var final_items []*ua.MonitoredItemNotification
 		final_items, more = s.drainQueues(s.notificationLimit())
 		if len(final_items) == 0 {
-			// The items that held the queued values were deleted in the meantime.
+			// The items that held the queued values were deleted in the meantime: answer with a
+			// keep-alive (Part 4 §5.14.1.2, Table 79 row 11: no notifications available). Table 79
+			// has no row for this while MoreNotifications is TRUE; a keep-alive is sent then too.
 			if err := s.keepalive(pubreq); err != nil {
 				if s.srv.srv.cfg.logger != nil {
 					s.srv.srv.cfg.logger.Warn("problem sending keepalive to subscription #%d: %v", s.ID, err)

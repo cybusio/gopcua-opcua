@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"math"
 	"slices"
 	"sync"
@@ -15,6 +14,12 @@ import (
 // MonitoredItemService implements the MonitoredItem Service Set.
 //
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13
+//
+// Lock order: a goroutine that holds both SubService.Mu and Mu takes
+// SubService.Mu first. Mu is never held while acquiring SubService.Mu:
+// SubscriptionService.DeleteSubscription holds SubService.Mu while it calls
+// DeleteSub, which takes Mu. A Subscription's own locks are taken last: no
+// other lock is acquired while one is held.
 type MonitoredItemService struct {
 	SubService *SubscriptionService
 	Mu         sync.Mutex
@@ -138,6 +143,10 @@ func (s *MonitoredItemService) queueNotificationLocked(item *MonitoredItem, node
 	if item == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
 		return
 	}
+	// A disabled item is not sampled (Part 4 §5.13.1.3).
+	if item.Mode == ua.MonitoringModeDisabled {
+		return
+	}
 
 	// The interval in use is always the one reported to the client.
 	interval := samplingDuration(item.RevisedSamplingInterval)
@@ -166,7 +175,7 @@ func (s *MonitoredItemService) firePendingNotification(id uint32) {
 	defer s.Mu.Unlock()
 
 	item, ok := s.Items[id]
-	if !ok || item == nil || !item.pending || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+	if !ok || item == nil || !item.pending || item.Mode == ua.MonitoringModeDisabled || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
 		return
 	}
 
@@ -213,7 +222,9 @@ type MonitoredItem struct {
 	Sub *Subscription
 	Req *ua.MonitoredItemCreateRequest
 
-	//TODO: use this
+	// Mode is the MonitoringMode of the item (Part 4 §5.13.1.3). A disabled
+	// item is not sampled; a sampling item queues its values without
+	// reporting them. Use SetMonitoringMode to change it.
 	Mode ua.MonitoringMode
 
 	// RevisedSamplingInterval is the sampling interval in use for the item,
@@ -224,8 +235,48 @@ type MonitoredItem struct {
 	pending       bool
 	pendingTimer  *time.Timer
 
-	// RevisedQueueSize is the queue size in use for the item.
+	// RevisedQueueSize reports the queue size in use for the item. The
+	// server sets it; changing it does not resize the queue.
 	RevisedQueueSize uint32
+}
+
+// subscriptionForCreate returns the Subscription that a CreateMonitoredItems
+// request adds its items to. If the request cannot be processed as a whole,
+// it returns the service result for a ServiceFault instead (Part 4 §5.13.2.3
+// Table 64 and §7.38.2 Table 178), checked in this order:
+// Bad_SessionIdInvalid if the authenticationToken identifies no Session,
+// Bad_SubscriptionIdInvalid if subscriptionId identifies no Subscription or
+// a Subscription of another Session (§5.14.1: a Subscription belongs to the
+// Session that created it), and Bad_NothingToDo for an empty itemsToCreate.
+// The caller must hold s.SubService.Mu.
+func (s *MonitoredItemService) subscriptionForCreate(req *ua.CreateMonitoredItemsRequest) (*Subscription, ua.StatusCode) {
+	hdr := req.RequestHeader
+	if hdr == nil || hdr.AuthenticationToken == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	sess := s.SubService.srv.Session(hdr)
+	if sess == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+	sub := s.SubService.Subs[req.SubscriptionID]
+	if sub == nil || sub.Session != sess {
+		return nil, ua.StatusBadSubscriptionIDInvalid
+	}
+	if len(req.ItemsToCreate) == 0 {
+		return nil, ua.StatusBadNothingToDo
+	}
+	return sub, ua.StatusOK
+}
+
+// createServiceFault answers a CreateMonitoredItems request that fails as a
+// whole. Part 4 §7.34: the ServiceFault carries the requestHandle the client
+// sent.
+func createServiceFault(hdr *ua.RequestHeader, status ua.StatusCode) ua.Response {
+	var handle uint32
+	if hdr != nil {
+		handle = hdr.RequestHandle
+	}
+	return &ua.ServiceFault{ResponseHeader: responseHeader(handle, status)}
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
@@ -246,6 +297,12 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if req.TimestampsToReturn > ua.TimestampsToReturnNeither {
 		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTimestampsToReturnInvalid)}, nil
 	}
+	// SubService.Mu is taken before s.Mu (see the lock order on
+	// MonitoredItemService) and held until the items are created, so the
+	// subscription cannot be deleted between the lookup and the creation of
+	// its items.
+	s.SubService.Mu.Lock()
+	defer s.SubService.Mu.Unlock()
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
@@ -257,22 +314,15 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if s.SubService.srv.cfg.logger != nil {
 		s.SubService.srv.cfg.logger.Debug("Creating monitored items for sub #%d", subID)
 	}
-	s.SubService.Mu.Lock()
-	sub, ok := s.SubService.Subs[subID]
-	s.SubService.Mu.Unlock()
-	if !ok {
-		return nil, errors.New("sub doesn't exist")
-	}
-
-	sess := s.SubService.srv.Session(req.RequestHeader)
-	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-		return nil, errors.New("not your subscription, bro")
+	sub, status := s.subscriptionForCreate(req)
+	if status != ua.StatusOK {
+		return createServiceFault(req.RequestHeader, status), nil
 	}
 
 	maxQueueSize := s.SubService.srv.cfg.cap.MaxMonitoredItemsQueueSize
 	for i := range req.ItemsToCreate {
-		// The item keeps its own copy of the request, so that the caller's
-		// request stays unchanged.
+		// The item keeps a shallow copy of the request, so that filling in
+		// defaults does not write to the caller's request.
 		reqCopy := *req.ItemsToCreate[i]
 		itemreq := &reqCopy
 		nodeid := itemreq.ItemToMonitor.NodeID
@@ -289,7 +339,7 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 			RevisedSamplingInterval: revisedSamplingInterval(params, sub.RevisedPublishingInterval),
 			RevisedQueueSize:        revisedQueueSize(params.QueueSize, maxQueueSize),
 		}
-		sub.createQueue(item.ID, params.ClientHandle, item.RevisedQueueSize, params.DiscardOldest)
+		sub.createQueue(item.ID, params.ClientHandle, item.RevisedQueueSize, params.DiscardOldest, item.Mode)
 
 		// book keeping of the new item
 		s.Items[item.ID] = &item
@@ -319,8 +369,9 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 			RevisedQueueSize:        item.RevisedQueueSize,
 			FilterResult:            ua.NewExtensionObject(nil),
 		}
-		// Queue the initial value of the new item. Only this item is
-		// sampled: other items on the same node keep their queues as they are.
+		// Queue the initial value of the new item (Part 4 §7.25.2) before
+		// responding, which §5.13.2.1 permits. Only this item is sampled:
+		// other items on the same node keep their queues as they are.
 		s.queueNotificationLocked(&item, nodeid)
 
 	}
@@ -475,7 +526,7 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 			results[i] = ua.StatusBadMonitoredItemIDInvalid
 			continue
 		}
-		item.Mode = req.MonitoringMode
+		s.setMonitoringModeLocked(item, req.MonitoringMode)
 		results[i] = ua.StatusOK
 	}
 
@@ -492,6 +543,43 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 		DiagnosticInfos: []*ua.DiagnosticInfo{},
 	}, nil
 
+}
+
+// setMonitoringModeLocked changes the MonitoringMode of item. The caller must
+// hold s.Mu.
+//
+// Part 4 §5.13.1.3: a disabled item is neither sampled nor reported, a
+// sampling item is sampled and its values are queued but not reported, and a
+// reporting item is sampled and reported. When an item is enabled, its first
+// sample is taken as soon as possible, whether or not the value changed while
+// it was disabled. §5.13.4.1: setting the mode to Disabled deletes all queued
+// values of the item. Setting the mode the item already has changes nothing.
+// §7.23 defines the three modes; any other value is treated as Reporting.
+func (s *MonitoredItemService) setMonitoringModeLocked(item *MonitoredItem, mode ua.MonitoringMode) {
+	prev := item.Mode
+	if mode == prev {
+		return
+	}
+	item.Mode = mode
+	if item.Sub != nil {
+		item.Sub.setQueueMode(item.ID, mode)
+	}
+
+	switch {
+	case mode == ua.MonitoringModeDisabled:
+		// Stop sampling: drop a sample deferred to the end of the
+		// sampling interval.
+		if item.pendingTimer != nil {
+			item.pendingTimer.Stop()
+			item.pendingTimer = nil
+		}
+		item.pending = false
+	case prev == ua.MonitoringModeDisabled:
+		if item.Sub == nil || item.Req == nil || item.Req.ItemToMonitor == nil || item.Req.ItemToMonitor.NodeID == nil {
+			return
+		}
+		s.dispatchNotificationLocked(item, item.Req.ItemToMonitor.NodeID, time.Now())
+	}
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.5
