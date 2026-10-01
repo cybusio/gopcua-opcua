@@ -14,6 +14,12 @@ import (
 // MonitoredItemService implements the MonitoredItem Service Set.
 //
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13
+//
+// Lock order: a goroutine that holds both SubService.Mu and Mu takes
+// SubService.Mu first. Mu is never held while acquiring SubService.Mu:
+// SubscriptionService.DeleteSubscription holds SubService.Mu while it calls
+// DeleteSub, which takes Mu. A Subscription's own locks are taken last: no
+// other lock is acquired while one is held.
 type MonitoredItemService struct {
 	SubService *SubscriptionService
 	Mu         sync.Mutex
@@ -242,6 +248,7 @@ type MonitoredItem struct {
 // Bad_SubscriptionIdInvalid if subscriptionId identifies no Subscription or
 // a Subscription of another Session (§5.14.1: a Subscription belongs to the
 // Session that created it), and Bad_NothingToDo for an empty itemsToCreate.
+// The caller must hold s.SubService.Mu.
 func (s *MonitoredItemService) subscriptionForCreate(req *ua.CreateMonitoredItemsRequest) (*Subscription, ua.StatusCode) {
 	hdr := req.RequestHeader
 	if hdr == nil || hdr.AuthenticationToken == nil {
@@ -251,9 +258,7 @@ func (s *MonitoredItemService) subscriptionForCreate(req *ua.CreateMonitoredItem
 	if sess == nil {
 		return nil, ua.StatusBadSessionIDInvalid
 	}
-	s.SubService.Mu.Lock()
 	sub := s.SubService.Subs[req.SubscriptionID]
-	s.SubService.Mu.Unlock()
 	if sub == nil || sub.Session != sess {
 		return nil, ua.StatusBadSubscriptionIDInvalid
 	}
@@ -292,6 +297,12 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 	if req.TimestampsToReturn > ua.TimestampsToReturnNeither {
 		return &ua.ServiceFault{ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTimestampsToReturnInvalid)}, nil
 	}
+	// SubService.Mu is taken before s.Mu (see the lock order on
+	// MonitoredItemService) and held until the items are created, so the
+	// subscription cannot be deleted between the lookup and the creation of
+	// its items.
+	s.SubService.Mu.Lock()
+	defer s.SubService.Mu.Unlock()
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 

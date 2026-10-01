@@ -53,7 +53,9 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 
 	delete(s.Subs, id)
 
-	// ask the monitored item service to purge out any items that use this subscription
+	// ask the monitored item service to purge out any items that use this subscription.
+	// s.Mu stays held, so DeleteSub takes MonitoredItemService.Mu inside it
+	// (see the lock order on MonitoredItemService).
 	s.srv.MonitoredItemService.DeleteSub(id)
 
 }
