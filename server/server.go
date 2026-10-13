@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -369,62 +370,76 @@ func (s *Server) Close() error {
 	return s.cb.Close()
 }
 
-type temporary interface {
-	Temporary() bool
+// handshakeTimeout bounds the UACP handshake of one connection. A client sends
+// Hello right after connecting, so this only ends connections that never will.
+const handshakeTimeout = 10 * time.Second
+
+// acceptAndRegister accepts connections until the listener is closed.
+//
+// Each handshake runs in its own goroutine. Run inline, one client that
+// connected and never sent Hello stopped every later client from connecting,
+// and one failed handshake (a client reset before its Hello arrived surfaces as
+// a *net.OpError) was taken for a closed socket and ended the loop for good.
+func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
+	var backoff time.Duration
+	for ctx.Err() == nil {
+		c, err := l.AcceptTCP()
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			// Running out of file descriptors and the like: back off as
+			// net/http does, so a persistent error does not spin.
+			backoff = min(max(2*backoff, 5*time.Millisecond), time.Second)
+			if s.cfg.logger != nil {
+				s.cfg.logger.Error("error accepting connection: %s; retrying in %s", err, backoff)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		backoff = 0
+		go s.handshakeAndRegister(ctx, l, c)
+	}
 }
 
-func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-			c, err := l.Accept(ctx)
-			if err != nil {
-				switch x := err.(type) {
-				case *net.OpError:
-					// socket closed. Cannot recover from this.
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("socket closed: %s", err)
-					}
-					return
-				case temporary:
-					if x.Temporary() {
-						continue
-					}
-				default:
-					if s.cfg.logger != nil {
-						s.cfg.logger.Error("error accepting connection: %s", err)
-					}
-					continue
-				}
-			}
+// handshakeAndRegister completes the UACP handshake on c and hands the
+// connection to the channel broker.
+func (s *Server) handshakeAndRegister(ctx context.Context, l *uacp.Listener, c *net.TCPConn) {
+	conn, err := l.Handshake(c, handshakeTimeout)
+	if err != nil {
+		if s.cfg.logger != nil {
+			s.cfg.logger.Warn("handshake with %s failed: %s", c.RemoteAddr(), err)
+		}
+		return
+	}
 
-			// Enforce the maxConnections cap before handing the
-			// freshly-accepted connection to the channel broker. The
-			// channel broker's `s` map is the authoritative count of
-			// live secure-channel connections; we read its length under
-			// its own RWMutex to avoid racing with RegisterConn or
-			// connection teardown. A zero cap disables the check
-			// (legacy gopcua behavior).
-			if s.cfg.maxConnections > 0 {
-				s.cb.mu.RLock()
-				count := len(s.cb.s)
-				s.cb.mu.RUnlock()
-				if count >= s.cfg.maxConnections {
-					if s.cfg.logger != nil {
-						s.cfg.logger.Warn("rejecting connection from %s: maxConnections (%d) reached", c.RemoteAddr(), s.cfg.maxConnections)
-					}
-					_ = c.Close()
-					continue
-				}
-			}
-			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey, s.handleService)
+	// Enforce the maxConnections cap before handing the
+	// freshly-accepted connection to the channel broker. The
+	// channel broker's `s` map is the authoritative count of
+	// live secure-channel connections; we read its length under
+	// its own RWMutex to avoid racing with RegisterConn or
+	// connection teardown. A zero cap disables the check
+	// (legacy gopcua behavior).
+	if s.cfg.maxConnections > 0 {
+		s.cb.mu.RLock()
+		count := len(s.cb.s)
+		s.cb.mu.RUnlock()
+		if count >= s.cfg.maxConnections {
 			if s.cfg.logger != nil {
-				s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
+				s.cfg.logger.Warn("rejecting connection from %s: maxConnections (%d) reached", conn.RemoteAddr(), s.cfg.maxConnections)
 			}
+			_ = conn.Close()
+			return
 		}
 	}
+	if s.cfg.logger != nil {
+		s.cfg.logger.Info("registered connection: %s", conn.RemoteAddr())
+	}
+	s.cb.RegisterConn(ctx, conn, s.cfg.certificate, s.cfg.privateKey, s.handleService)
 }
 
 // initEndpoints builds the endpoint list from the server's configuration
