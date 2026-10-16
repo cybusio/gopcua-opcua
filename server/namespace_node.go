@@ -149,10 +149,15 @@ func (as *NodeNameSpace) Attribute(id *ua.NodeID, attr ua.AttributeID) *ua.DataV
 		if err != nil {
 			return errorDataValueWithStatus(ua.StatusBadAttributeIDInvalid)
 		}
-		// TODO: we need int32 instead of uint32 here.  this isn't the right place to fix it, but it is a bandaid
-		x, ok := a.Value.Value.Value().(uint32)
-		if ok {
-			a.Value.Value = ua.MustVariant(int32(x))
+		// OPC UA Part 3, 8.29 defines NodeClass as an Enumeration, which
+		// Part 6, 5.2.4 encodes as an Int32.
+		// TODO: store NodeClass as int32 when the node is built; until then
+		// convert it here. Node.Attribute returns the stored DataValue, so
+		// convert a copy and leave the stored attribute untouched.
+		if x, ok := a.Value.Value.Value().(uint32); ok {
+			dv := *a.Value
+			dv.Value = ua.MustVariant(int32(x))
+			return &dv
 		}
 	case ua.AttributeIDDataType:
 		a, err = n.Attribute(attr)
