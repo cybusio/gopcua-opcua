@@ -43,16 +43,15 @@ This package has two pieces of machinery of its own:
 - **A race is scored in a child process.** The Go race detector fails
   the test binary itself when it reports — measured: a run of the race
   row failed with `WARNING: DATA RACE` from the runtime, with none of
-  the row's own arms firing — so no `knownBug` arm inside the row can
+  the row's own arms firing — so no arm inside the row can
   intercept a race. The race row
   therefore runs its window in a child of the test binary and reads the
   child's output and exit. A child whose output holds `WARNING: DATA
   RACE` exits **nonzero** - the testing framework fails the very test
   that raced - so the exit code is material only when the output holds
   no report. Keying on the exit code alone makes the row decline every
-  run. The known-bug arm keys on the detector's report naming the row's
-  Attribute frame, a presence a fixed library does not show, and the
-  deletion arm keys on a clean child that completed at least ten reads
+  run. A report in the child's output fails the row, and the
+  pass keys on a clean child that completed at least ten reads
   inside a two-second window - the floor is what stops an empty run
   passing, so it needs a number and not just a name. A
   plain `go test` without `-race` cannot score the row at all, and the
@@ -130,17 +129,17 @@ silence means nobody checked rather than nothing to report.
 
 ## The knownBug ledger, 2026-11-06
 
-One constant stands per row below, declared inside its test function.
+No constant stands in this package.
 
 | row | state |
 |---|---|
-| `read_while_writing_is_race_free_test.go` | `knownBug` stands: `MapNamespace.Attribute` reads `ns.Data` without the namespace lock (`server/namespace_map.go:195 and :256`) while `SetValue` writes it under the lock. Measured 2026-11-05: `WARNING: DATA RACE` under `go test -count=1 -race -run TestReadWhileWritingIsRaceFree ./tests/server/`. |
+| `read_while_writing_is_race_free_test.go` | no constant; gopcua passes it as it stands (measured 2026-11-18 under `-race`: the window child completed its reads with no detector report). The constant that stood here until then recorded that `MapNamespace.Attribute` read `ns.Data` without a lock while `SetValue` wrote it under the namespace lock (measured 2026-11-05: `WARNING: DATA RACE` under `go test -count=1 -race -run TestReadWhileWritingIsRaceFree ./tests/server/`). It was closed by a lock of its own for the map, `dataMu`: `Attribute` reads `ns.Data` under it, and `SetValue` and `SetAttribute` take it around their write only and release it before they notify. |
 | `setvalue_on_a_subscribed_tag_returns_test.go` | no constant; gopcua passes it as it stands (measured 2026-11-06, 1.41s under `-race`). It exists to catch the regression the fix for the row above invites: with an RLock added to `Attribute` — the obvious fix — `SetValue` wedges (measured, 6.35s, "did not return within 5s"). |
 | `setattribute_on_a_subscribed_tag_returns_test.go` | no constant; gopcua passes it as it stands (measured 2026-11-06, 1.45s under `-race`). Same guard, at the call site a client Write lands on. |
 | `client_keeps_working_across_token_renewals_test.go` | no constant; gopcua passes it as it stands (measured 2026-11-16, 17.1s, all three policy arms). It exists to catch a secure channel change that passes every other row and every unit test: an expiry keyed by the secure channel id instead of the token id empties the very bucket the chunk dispatch reads, and because the in-tree server answers each renewal with the same TokenId, the wipe takes the renewed token too — every response after an expiry is then dropped until the next renewal. Measured with that mutant applied: every arm's Read at the first expiry fails, `EOF` on this tree, `StatusBadTimeout` on one that drops silently instead of closing. |
 
-The constant in `read_while_writing_is_race_free_test.go` is expected to
-be closed by a change to `Attribute`'s locking. The two write-half rows
+The constant in `read_while_writing_is_race_free_test.go` was closed by
+a change to `Attribute`'s locking. The two write-half rows
 are the guard that such a change does not trade the race for a deadlock:
 measured, an RLock in `Attribute` turns both write call sites into
 self-deadlocks, because the notification path re-enters `Attribute` on

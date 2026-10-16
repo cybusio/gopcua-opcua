@@ -102,9 +102,9 @@ func (s *Server) RegisterHandler(typeID uint16, h Handler) {
 }
 
 func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqID uint32, req ua.Request) {
-	// All requests of all secure channels are dispatched from one goroutine,
-	// so a panic in a handler, or while its response is encoded, would stop
-	// the server. Answer that request with Bad_InternalError instead.
+	// A panic in a handler, or while its response is encoded, would stop the
+	// server. Answer that request with Bad_InternalError instead; the secure
+	// channel goes on with its next request.
 	defer func() {
 		if v := recover(); v != nil {
 			s.answerServicePanic(ctx, sc, reqID, req, v)
@@ -140,6 +140,10 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	}
 
 	if resp == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		// The secure channel ended while the request was handled.
 		return
 	}
 

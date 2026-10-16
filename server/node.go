@@ -4,6 +4,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/gopcua/opcua/id"
@@ -65,16 +66,22 @@ func DataValueFromValue(val any) *ua.DataValue {
 }
 
 type Node struct {
-	id   *ua.NodeID
+	id *ua.NodeID
+
+	// mu guards attr and val. Service handlers of different secure channels
+	// read and write them concurrently (Read, Write, Browse, MonitoredItem
+	// sampling). A value function is called without mu held.
+	mu   sync.RWMutex
 	attr Attributes
-	refs References
 	val  ValueFunc
+
+	refs References
 
 	ns NameSpace
 }
 
 func NewNode(id *ua.NodeID, attr Attributes, refs References, val ValueFunc) *Node {
-	n := &Node{id, attr, refs, val, nil}
+	n := &Node{id: id, attr: attr, refs: refs, val: val}
 	n.sanitize()
 	return n
 }
@@ -174,32 +181,47 @@ func (n *Node) ID() *ua.NodeID {
 	return n.id
 }
 
+func (n *Node) valueFunc() ValueFunc {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.val
+}
+
+// attribute returns the stored value of attribute id, or nil.
+func (n *Node) attribute(id ua.AttributeID) *ua.DataValue {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return n.attr[id]
+}
+
+func (n *Node) setAttribute(id ua.AttributeID, v *ua.DataValue) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.attr == nil {
+		n.attr = Attributes{}
+	}
+	n.attr[id] = v
+}
+
 func (n *Node) Value() *ua.DataValue {
-	if n.val == nil {
+	val := n.valueFunc()
+	if val == nil {
 		return nil
 	}
-	return n.val()
+	return val()
 }
 
 func (n *Node) Attribute(id ua.AttributeID) (*AttrValue, error) {
-	switch {
-	case id == ua.AttributeIDValue:
-		if n.val != nil {
-			val := n.val()
-			if val == nil {
-				return nil, ua.StatusBadAttributeIDInvalid
-			}
+	if id == ua.AttributeIDValue {
+		if val := n.Value(); val != nil {
 			return NewAttrValue(val), nil
 		}
 		return nil, ua.StatusBadAttributeIDInvalid
-	case n.attr == nil:
-		return nil, ua.StatusBadAttributeIDInvalid
-	default:
-		if v := n.attr[id]; v != nil {
-			return NewAttrValue(v), nil
-		}
-		return nil, ua.StatusBadAttributeIDInvalid
 	}
+	if v := n.attribute(id); v != nil {
+		return NewAttrValue(v), nil
+	}
+	return nil, ua.StatusBadAttributeIDInvalid
 }
 
 func (n *Node) SetAttribute(id ua.AttributeID, val *ua.DataValue) error {
@@ -209,18 +231,20 @@ func (n *Node) SetAttribute(id ua.AttributeID, val *ua.DataValue) error {
 
 		// TODO: probably need to do some type checking here.
 		// And some permissions tests
+		n.mu.Lock()
 		n.val = func() *ua.DataValue {
 			return val
 		}
+		n.mu.Unlock()
 	default:
-		n.attr[id] = val
+		n.setAttribute(id, val)
 	}
 
 	return nil
 }
 
 func (n *Node) BrowseName() *ua.QualifiedName {
-	v := n.attr[ua.AttributeIDBrowseName]
+	v := n.attribute(ua.AttributeIDBrowseName)
 	if v == nil || v.Value.Value() == nil {
 		return &ua.QualifiedName{}
 	}
@@ -228,10 +252,13 @@ func (n *Node) BrowseName() *ua.QualifiedName {
 }
 
 func (n *Node) SetBrowseName(s string) {
-	n.attr[ua.AttributeIDBrowseName] = DataValueFromValue(&ua.QualifiedName{Name: s})
+	n.setAttribute(ua.AttributeIDBrowseName, DataValueFromValue(&ua.QualifiedName{Name: s}))
 }
 
 func (n *Node) DisplayName() *ua.LocalizedText {
+	// UpdateMask changes the stored value.
+	n.mu.Lock()
+	defer n.mu.Unlock()
 	v := n.attr[ua.AttributeIDDisplayName]
 	if v == nil || v.Value.Value() == nil {
 		return &ua.LocalizedText{}
@@ -244,11 +271,11 @@ func (n *Node) DisplayName() *ua.LocalizedText {
 func (n *Node) SetDisplayName(text, locale string) {
 	lt := &ua.LocalizedText{Text: text, Locale: locale}
 	lt.UpdateMask()
-	n.attr[ua.AttributeIDDisplayName] = DataValueFromValue(lt)
+	n.setAttribute(ua.AttributeIDDisplayName, DataValueFromValue(lt))
 }
 
 func (n *Node) Description() *ua.LocalizedText {
-	v := n.attr[ua.AttributeIDDescription]
+	v := n.attribute(ua.AttributeIDDescription)
 	if v == nil || v.Value.Value() == nil {
 		return &ua.LocalizedText{}
 	}
@@ -256,7 +283,7 @@ func (n *Node) Description() *ua.LocalizedText {
 }
 
 func (n *Node) SetDescription(text, locale string) {
-	n.attr[ua.AttributeIDDescription] = DataValueFromValue(&ua.LocalizedText{Text: text, Locale: locale})
+	n.setAttribute(ua.AttributeIDDescription, DataValueFromValue(&ua.LocalizedText{Text: text, Locale: locale}))
 }
 
 func (n *Node) DataType() *ua.ExpandedNodeID {
@@ -264,7 +291,7 @@ func (n *Node) DataType() *ua.ExpandedNodeID {
 		log.Printf("n was nil!")
 		return ua.NewTwoByteExpandedNodeID(0)
 	}
-	v := n.attr[ua.AttributeIDDataType]
+	v := n.attribute(ua.AttributeIDDataType)
 	if v == nil || v.Value.Value() == nil {
 		// if we have a type definition, return that?
 		for i := range n.refs {
@@ -311,11 +338,11 @@ func (n *Node) typeDefinition() *ua.ExpandedNodeID {
 }
 
 func (n *Node) SetNodeClass(nc ua.NodeClass) {
-	n.attr[ua.AttributeIDNodeClass] = DataValueFromValue(uint32(nc))
+	n.setAttribute(ua.AttributeIDNodeClass, DataValueFromValue(uint32(nc)))
 }
 
 func (n *Node) NodeClass() ua.NodeClass {
-	v := n.attr[ua.AttributeIDNodeClass]
+	v := n.attribute(ua.AttributeIDNodeClass)
 	if v == nil || v.Value.Value() == nil {
 		return ua.NodeClassObject
 	}
@@ -334,12 +361,14 @@ func (n *Node) NodeClass() ua.NodeClass {
 func (n *Node) AddObject(o *Node) *Node {
 	nn := &Node{
 		id:   o.id,
-		attr: maps.Clone(o.attr),
+		attr: o.cloneAttr(),
 		refs: slices.Clone(o.refs),
 	}
+	n.mu.Lock()
 	if n.attr == nil {
 		n.attr = Attributes{}
 	}
+	n.mu.Unlock()
 	nn.SetNodeClass(ua.NodeClassObject)
 	n.refs = append(n.refs, refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
 	return n.ns.AddNode(nn)
@@ -348,16 +377,24 @@ func (n *Node) AddObject(o *Node) *Node {
 func (n *Node) AddVariable(o *Node) *Node {
 	nn := &Node{
 		id:   o.id,
-		attr: maps.Clone(o.attr),
+		attr: o.cloneAttr(),
 		refs: slices.Clone(o.refs),
-		val:  o.val,
+		val:  o.valueFunc(),
 	}
+	n.mu.Lock()
 	if n.attr == nil {
 		n.attr = Attributes{}
 	}
+	n.mu.Unlock()
 	nn.SetNodeClass(ua.NodeClassVariable)
 	n.refs = append(n.refs, refs.Organizes(nn.id, nn.BrowseName().Name, nn.DisplayName().Text, nn.DataType()))
 	return nn
+}
+
+func (n *Node) cloneAttr() Attributes {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	return maps.Clone(n.attr)
 }
 
 type RefType int
@@ -404,7 +441,7 @@ func (n *Node) RemoveRef(childID *ua.NodeID) {
 // I'm not sure what the best way to implement "user" specific access levels
 // is presently.  Will need functioning user authentication first, and then a way to
 // pass it into the nodes user access attribute so it can be checked properly.
-func (n Node) Access(flag ua.AccessLevelType) bool {
+func (n *Node) Access(flag ua.AccessLevelType) bool {
 
 	access, err := n.Attribute(ua.AttributeIDUserAccessLevel)
 	if err == nil { // if we have a user access level, we need to check it.

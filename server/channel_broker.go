@@ -13,6 +13,16 @@ import (
 	"github.com/gopcua/opcua/uasc"
 )
 
+// maxQueuedRequests is the number of requests of one secure channel that wait
+// while an earlier request of that channel is handled. A request that arrives
+// when that many are waiting is answered at once with Bad_ResourceUnavailable
+// and not handled.
+const maxQueuedRequests = 64
+
+// requestHandler handles one service request of a secure channel and sends
+// its response.
+type requestHandler func(ctx context.Context, sc *uasc.SecureChannel, reqID uint32, req ua.Request)
+
 type channelBroker struct {
 	endpoints map[string]*ua.EndpointDescription
 
@@ -29,10 +39,7 @@ type channelBroker struct {
 	// Next Token ID to issue to a client
 	secureTokenID uint32
 
-	// msgChan is the common channel that all messages from all channels
-	// get funneled into for handling
-	msgChan chan *uasc.MessageBody
-	logger  Logger
+	logger Logger
 }
 
 func newChannelBroker(logger Logger) *channelBroker {
@@ -40,7 +47,6 @@ func newChannelBroker(logger Logger) *channelBroker {
 	return &channelBroker{
 		endpoints:       make(map[string]*ua.EndpointDescription),
 		s:               make(map[uint32]*uasc.SecureChannel),
-		msgChan:         make(chan *uasc.MessageBody),
 		secureChannelID: uint32(rng.Int31()),
 		secureTokenID:   uint32(rng.Int31()),
 		logger:          logger,
@@ -48,10 +54,17 @@ func newChannelBroker(logger Logger) *channelBroker {
 }
 
 // RegisterConn connects a new UACP connection to the channel broker's list
-// of connections and starts waiting for data on it.  Data is pushed onto the broker's
-// Response channel
+// of connections and starts waiting for data on it. Each service request is
+// passed to handle.
+//
+// The requests of the channel are handled one at a time, in the order they
+// arrive, on a goroutine of the channel, so that a request that takes long
+// delays no other channel. The channel keeps reading meanwhile, so that
+// OpenSecureChannel and CloseSecureChannel are processed, and queues further
+// requests, up to maxQueuedRequests.
+//
 // Blocks until the context is done, the connection closes, or a critical error
-func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey) error {
+func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, localCert []byte, localKey *rsa.PrivateKey, handle requestHandler) error {
 	cfg := defaultChannelConfig()
 	cfg.Certificate = localCert
 	cfg.LocalKey = localKey
@@ -88,6 +101,15 @@ func (c *channelBroker) RegisterConn(ctx context.Context, conn *uacp.Conn, local
 	}
 	c.mu.Unlock()
 	c.wg.Add(1)
+
+	// The requests of the channel wait in queue for serveRequests. Ending ctx
+	// ends serveRequests once the request it handles, if any, returns; the
+	// requests still waiting are dropped and the response of that request is
+	// not sent, as the channel is gone.
+	ctx, cancel := context.WithCancel(ctx)
+	queue := make(chan *uasc.MessageBody, maxQueuedRequests)
+	go c.serveRequests(ctx, sc, queue, handle)
+
 outer:
 	for {
 		select {
@@ -111,10 +133,10 @@ outer:
 				}
 				break outer
 			}
-			// todo(fs): honor ctx
-			c.msgChan <- msg
+			c.queueRequest(ctx, sc, queue, msg)
 		}
 	}
+	cancel()
 
 	// The receive loop has ended: the client sent CloseSecureChannel (which
 	// the channel surfaces as io.EOF), closed its end of the connection, the
@@ -138,6 +160,60 @@ outer:
 	c.wg.Done()
 
 	return nil
+}
+
+// queueRequest queues the service request in msg for serveRequests without
+// waiting. When maxQueuedRequests requests of the channel are already
+// waiting, the request is answered with Bad_ResourceUnavailable, "An
+// operating system resource is not available." (Part 4 §7.38.2 Table 178),
+// with its requestHandle in the ResponseHeader (Part 4 §7.33), and not
+// handled. The answer is sent
+// from the receive loop of the channel, so it can only wait for that
+// channel's own connection.
+func (c *channelBroker) queueRequest(ctx context.Context, sc *uasc.SecureChannel, queue chan<- *uasc.MessageBody, msg *uasc.MessageBody) {
+	req := msg.Request()
+	if req == nil {
+		// OpenSecureChannel is handled by the secure channel itself and
+		// leaves an empty message.
+		if resp := msg.Response(); resp != nil && c.logger != nil {
+			c.logger.Error("Secure Channel %d: server received response %T", msg.SecureChannelID, resp)
+		}
+		return
+	}
+
+	select {
+	case queue <- msg:
+		return
+	default:
+	}
+
+	if c.logger != nil {
+		c.logger.Warn("Secure Channel %d: %d requests waiting, rejecting %T", msg.SecureChannelID, maxQueuedRequests, req)
+	}
+	var handle uint32
+	if hdr := req.Header(); hdr != nil {
+		handle = hdr.RequestHandle
+	}
+	fault := &ua.ServiceFault{ResponseHeader: responseHeader(handle, ua.StatusBadResourceUnavailable)}
+	if err := sc.SendResponseWithContext(ctx, msg.RequestID, fault); err != nil && c.logger != nil {
+		c.logger.Warn("Error sending response: %s\n", err)
+	}
+}
+
+// serveRequests passes the requests from queue to handle, one at a time, in
+// order, until ctx is done.
+func (c *channelBroker) serveRequests(ctx context.Context, sc *uasc.SecureChannel, queue <-chan *uasc.MessageBody, handle requestHandler) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case msg := <-queue:
+			if ctx.Err() != nil {
+				return
+			}
+			handle(ctx, sc, msg.RequestID, msg.Request())
+		}
+	}
 }
 
 // Close gracefully closes all secure channels
@@ -165,13 +241,4 @@ func (c *channelBroker) Close() error {
 	}
 
 	return err
-}
-
-func (c *channelBroker) ReadMessage(ctx context.Context) *uasc.MessageBody {
-	select {
-	case <-ctx.Done():
-		return nil
-	case msg := <-c.msgChan:
-		return msg
-	}
 }

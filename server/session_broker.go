@@ -13,6 +13,11 @@ import (
 type session struct {
 	cfg sessionConfig
 
+	// mu guards serverNonce and remoteCertificate. A Session may be
+	// activated from several secure channels at the same time (Part 4
+	// §5.6.3), whose requests are handled concurrently.
+	mu sync.Mutex
+
 	ID                *ua.NodeID
 	AuthTokenID       *ua.NodeID
 	serverNonce       []byte
