@@ -1,6 +1,7 @@
 package server
 
 import (
+	"sync"
 	"testing"
 
 	"github.com/gopcua/opcua/ua"
@@ -57,4 +58,71 @@ func TestReadNonValueAttribute_AccessLevelValueOnly(t *testing.T) {
 	if dv := ns.Attribute(nodeID, ua.AttributeIDValue); dv.Status != ua.StatusBadUserAccessDenied {
 		t.Errorf("read of Value attribute returned status %v; want Bad_UserAccessDenied", dv.Status)
 	}
+}
+
+// TestAttributeNodeClassLeavesNodeUnchanged verifies that reading the
+// NodeClass attribute returns it as an Int32 without rewriting the value
+// stored on the Node.
+//
+// OPC UA Part 3 §8.29 defines NodeClass as an Enumeration, which Part 6 §5.2.4
+// encodes as an Int32. The Node constructors store it as a UInt32, so Attribute
+// converts it on the way out. Node.Attribute hands out the stored
+// *ua.DataValue, so the conversion must work on a copy: otherwise the first
+// read changes the type Node.Attribute reports, and reads that run at the same
+// time race on the stored value.
+func TestAttributeNodeClassLeavesNodeUnchanged(t *testing.T) {
+	srv := New()
+	ns := NewNodeNameSpace(srv, "urn:test:nodeclass")
+
+	nodeID := ua.NewStringNodeID(ns.ID(), "var")
+	n := NewVariableNode(nodeID, "Var", int32(42))
+	ns.AddNode(n)
+
+	stored, err := n.Attribute(ua.AttributeIDNodeClass)
+	if err != nil {
+		t.Fatalf("Node.Attribute(NodeClass): %v", err)
+	}
+	want := stored.Value.Value.Value()
+
+	dv := ns.Attribute(nodeID, ua.AttributeIDNodeClass)
+	if got := dv.Value.Value(); got != int32(ua.NodeClassVariable) {
+		t.Fatalf("read NodeClass = %#v, want %#v", got, int32(ua.NodeClassVariable))
+	}
+
+	after, err := n.Attribute(ua.AttributeIDNodeClass)
+	if err != nil {
+		t.Fatalf("Node.Attribute(NodeClass): %v", err)
+	}
+	if got := after.Value.Value.Value(); got != want {
+		t.Errorf("stored NodeClass after a read = %v (%T), want %v (%T)", got, got, want, want)
+	}
+	if after.Value == dv {
+		t.Errorf("Attribute returned the stored DataValue")
+	}
+}
+
+// TestAttributeNodeClassConcurrentReads reads the NodeClass attribute of one
+// Node from several goroutines. Run with -race.
+func TestAttributeNodeClassConcurrentReads(t *testing.T) {
+	srv := New()
+	ns := NewNodeNameSpace(srv, "urn:test:nodeclass")
+
+	nodeID := ua.NewStringNodeID(ns.ID(), "var")
+	ns.AddNode(NewVariableNode(nodeID, "Var", int32(42)))
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 50 {
+				dv := ns.Attribute(nodeID, ua.AttributeIDNodeClass)
+				if got := dv.Value.Value(); got != int32(ua.NodeClassVariable) {
+					t.Errorf("NodeClass = %#v, want %#v", got, int32(ua.NodeClassVariable))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
