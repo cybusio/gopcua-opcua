@@ -345,7 +345,6 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	go s.acceptAndRegister(ctx, s.l)
-	go s.monitorConnections(ctx)
 
 	return nil
 }
@@ -420,50 +419,11 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 					continue
 				}
 			}
-			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey)
+			go s.cb.RegisterConn(ctx, c, s.cfg.certificate, s.cfg.privateKey, s.handleService)
 			if s.cfg.logger != nil {
 				s.cfg.logger.Info("registered connection: %s", c.RemoteAddr())
 			}
 		}
-	}
-}
-
-// monitorConnections reads messages off the secure channel connection and
-// sends the message to the service handler
-func (s *Server) monitorConnections(ctx context.Context) {
-	for ctx.Err() == nil {
-		msg := s.cb.ReadMessage(ctx)
-		if msg == nil {
-			continue // ctx is likely done, ctx.Err will be non-nil
-		}
-		if msg.Err != nil {
-			if s.cfg.logger != nil {
-				s.cfg.logger.Error("monitorConnections: Error received: %s\n", msg.Err)
-			}
-			continue // todo(fs): close SC???
-		}
-		if resp := msg.Response(); resp != nil {
-			if s.cfg.logger != nil {
-				s.cfg.logger.Error("monitorConnections: Server received response %T ???", resp)
-			}
-			continue // todo(fs): close SC???
-		}
-		if s.cfg.logger != nil {
-			s.cfg.logger.Debug("monitorConnections: Received Message: %T", msg.Request())
-		}
-		s.cb.mu.RLock()
-		sc, ok := s.cb.s[msg.SecureChannelID]
-		s.cb.mu.RUnlock()
-		if !ok {
-			// if the secure channel ID is 0, this is probably a open secure channel request.
-			if s.cfg.logger != nil && msg.SecureChannelID != 0 {
-				s.cfg.logger.Error("monitorConnections: Unknown SecureChannel: %d", msg.SecureChannelID)
-			}
-			continue
-		}
-
-		// todo: should this be delegated to another goroutine in case handling this hangs?
-		s.handleService(ctx, sc, msg.RequestID, msg.Request())
 	}
 }
 
