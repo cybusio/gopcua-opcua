@@ -24,6 +24,12 @@ type MapNamespace struct {
 	Mu   sync.RWMutex
 	Data map[string]any
 
+	// dataMu guards Data against Attribute, which reads it for the service
+	// handlers of all secure channels concurrently and cannot take Mu:
+	// SetValue holds Mu while ChangeNotification samples through Attribute.
+	// SetValue and SetAttribute hold Mu and dataMu to change Data.
+	dataMu sync.RWMutex
+
 	// This can be used to be alerted when a value is changed from the opc server
 	ExternalNotification chan string
 
@@ -45,7 +51,9 @@ func (s *MapNamespace) GetValue(key string) any {
 func (s *MapNamespace) SetValue(key string, value any) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
+	s.dataMu.Lock()
 	s.Data[key] = value
+	s.dataMu.Unlock()
 	s.ChangeNotification(key)
 }
 
@@ -171,6 +179,9 @@ func (ns *MapNamespace) Attribute(n *ua.NodeID, a ua.AttributeID) *ua.DataValue 
 	}
 
 	key := n.StringID()
+
+	ns.dataMu.RLock()
+	defer ns.dataMu.RUnlock()
 
 	var err error
 	if ns.srv.cfg.logger != nil {
@@ -350,7 +361,9 @@ func (s *MapNamespace) SetAttribute(node *ua.NodeID, attr ua.AttributeID, val *u
 	// going to use the node id directly to look it up from our data map.
 	if attr == ua.AttributeIDValue {
 		v := val.Value.Value()
+		s.dataMu.Lock()
 		s.Data[key] = v
+		s.dataMu.Unlock()
 	}
 
 	// notify the opc ua server the value has changed.

@@ -50,8 +50,10 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		log.Printf("error creating session nonce")
 		return nil, ua.StatusBadInternalError
 	}
+	sess.mu.Lock()
 	sess.serverNonce = nonce
 	sess.remoteCertificate = req.ClientCertificate
+	sess.mu.Unlock()
 
 	sig, alg, err := sc.NewSessionSignature(req.ClientCertificate, req.ClientNonce)
 	if err != nil {
@@ -102,6 +104,12 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	if sess == nil {
 		return nil, ua.StatusBadSessionIDInvalid
 	}
+
+	// The client signature is checked against the last nonce issued for the
+	// Session, which the new one then replaces. Activations of the Session
+	// from different secure channels take turns.
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
 
 	err = sc.VerifySessionSignature(sess.remoteCertificate, sess.serverNonce, req.ClientSignature.Signature)
 	if err != nil {

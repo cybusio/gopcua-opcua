@@ -7,9 +7,8 @@
 // observes a torn or conflicting state.
 //
 // The clause is the Go memory model, not an OPC UA shall: Attribute reads
-// ns.Data without the namespace lock (server/namespace_map.go:195
-// and :256) while
-// SetValue writes it under the lock (server/namespace_map.go:48), and a
+// ns.Data for a client's Read while SetValue writes it for the
+// application, and a
 // Go map read concurrent with a map write is a data race the runtime
 // catches and reports as "WARNING: DATA RACE", failing the run of the
 // binary that raced. A map read concurrent with a map write is also a
@@ -18,10 +17,13 @@
 // on is the detector's. The specification's
 // nearest clause is OPC 10000-3 §5.6.2 8.58, "In general Atomicity is
 // expected of OPC UA read and write operations" - descriptive rather
-// than a shall, and not checkable in this tree. gopcua does not have the
-// behaviour yet: measured 2026-11-05 with go test -count=1 -race -run
-// TestReadWhileWritingIsRaceFree ./tests/server/, which failed with
-// "WARNING: DATA RACE" on the read at server/namespace_map.go:195 in
+// than a shall, and not checkable in this tree. gopcua passes this row:
+// Attribute reads ns.Data under a lock of its own, dataMu, which SetValue
+// and SetAttribute take around their write to the map and release before
+// they notify. Before that lock Attribute read ns.Data without any, while
+// SetValue wrote it under the namespace lock: measured 2026-11-05 with go
+// test -count=1 -race -run TestReadWhileWritingIsRaceFree ./tests/server/,
+// which failed with "WARNING: DATA RACE" on the read in
 // (*MapNamespace).Attribute against the SetValue write.
 //
 // Neighbouring rows: setvalue_on_a_subscribed_tag_returns_test.go and
@@ -32,37 +34,33 @@
 // and a change that passes all three is the only shape a fix can take.
 // Neither of those rows scores a concurrent reader; this one scores
 // only the reads, not the write. The fixture configures no logger, so
-// the logger-guarded whole-map read of ns.Data
-// (server/namespace_map.go:178) is a declared blind spot the row
-// cannot score.
+// the logger-guarded whole-map read of ns.Data in Attribute is a
+// declared blind spot the row cannot score.
 //
 // The row runs against the in-tree gopcua server holding one
 // MapNamespace and a real gopcua client connected over the wire - the
 // shared fixture in harness.go - brought up inside the window child the
 // body spawns, with the writer on its own goroutine and the reads
 // issued through the client's Read service. That Read asks for the
-// tag's Value and DataType attributes, so a fix must lock every
-// ns.Data read in Attribute.
+// tag's Value and DataType attributes, so every ns.Data read in
+// Attribute has to be locked.
 // See harness.go.
 //
-// The body declares the knownBug constant inside the test function and
-// scores the window in a child of the test binary: the race
+// The body scores the window in a child of the test binary: the race
 // detector's failure cannot be an arm in-process - it fails the test
-// binary itself, so a knownBug arm can never intercept it - so the
+// binary itself - so the
 // window runs in a child, selected by an environment variable, and the
 // arms read the child's output. The child-process scorer lives in this
 // file, and the child prints its read count on stdout under the marker
-// race_free_reads_completed, which the parent parses. The arm that logs
-// the known bug keys on the detector's report naming the Attribute
-// frame - the bug's presence, which a fixed library does not show; the
-// arm that demands
-// the constant's deletion keys on the child exiting clean after at least
+// race_free_reads_completed, which the parent parses. A detector report
+// in the child's output fails the row; the pass keys on the child
+// exiting clean after at least
 // ten reads inside a two-second window - the floor is what stops an
 // empty run from passing. A clean child under the floor, a child that
 // never printed its count, or a binary not built with -race are each a
 // decline, not a pass.
 //
-// A fix that only adds RLock to Attribute wedges the server: the reads
+// Taking the namespace lock in Attribute instead wedges the server: the reads
 // complete until the first write takes the namespace lock and notifies,
 // and from then on the writer never returns from SetValue - the
 // notification path re-enters Attribute while the caller holds the lock -
@@ -70,20 +68,22 @@
 // arm keys on the child's wedge line instead. The child times the
 // writer's stop out, prints its wedge line and exits failed with no
 // detector report to show. That is gopcua's own behaviour, so the row
-// scores it as a failure, not a decline - the proxy the
-// knownBug arm keys on is gone and the outcome is still wrong, which is
-// the wrong-fix arm tests/README.md describes. The deletion arm
-// therefore fires only for a fix under which the writer still returns -
-// RLock plus notifying outside the lock. `make conformance` runs this
+// scores it as a failure, not a decline - there is no report and the
+// outcome is still wrong, which is
+// the wrong-fix arm tests/README.md describes. The row
+// therefore passes only while the writer still returns: the map is
+// locked for the write alone and the notification runs outside that
+// lock. `make conformance` runs this
 // package with -race.
 //
 // The wedge happens only through a subscription: SetValue notifies under
 // the lock, and the notification re-enters Attribute only when a
 // monitored item exists on the tag. So the window child must hold a
 // monitored item on the tag its writer writes, even though the row
-// scores only the reads. Without one, an RLock-only fix
+// scores only the reads. Without one, a library that takes the
+// namespace lock in Attribute
 // completes its reads cleanly, the child exits clean past the floor, and
-// the row demands the constant's deletion for a fix that still deadlocks
+// the row passes a library that deadlocks
 // every server with a subscriber - the two write-half rows are named "on
 // a subscribed tag" for the same reason. The read count is asserted
 // separately because the detector only reports interleavings it sees, so
@@ -132,12 +132,9 @@ const (
 	// read count under and the parent parses; the floor is read off it.
 	raceRowReadsMarker = "race_free_reads_completed"
 
-	// raceReport is the detector's report line and raceFrameAttribute the
-	// frame in it that names the read the knownBug constant stands for.
-	// The known-bug arm requires both: a report outside that frame is a
-	// race the constant does not cover, whether or not it stands.
-	raceReport         = "WARNING: DATA RACE"
-	raceFrameAttribute = "(*MapNamespace).Attribute"
+	// raceReport is the detector's report line. Any report in the window
+	// child's output fails the row.
+	raceReport = "WARNING: DATA RACE"
 
 	// raceRowWedgeText is the wedge clause the window child prints when
 	// its writer does not stop after the window, and the wrong-fix arm's
@@ -175,13 +172,6 @@ const (
 )
 
 func TestReadWhileWritingIsRaceFree(t *testing.T) {
-	// knownBug records that gopcua does not do this yet; the text is logged
-	// in place of a failure. README.md says when to delete it.
-	const knownBug = "a client Read concurrent with the application's SetValue " +
-		"conflicts with it on MapNamespace.Data: Attribute reads ns.Data without " +
-		"the namespace lock, server/namespace_map.go:195 and :256, while " +
-		"SetValue writes it under the lock"
-
 	// The window branch: this binary re-running itself as the child whose
 	// output the parent's arms read. A setup failure here is a fixture
 	// cause - the parent never reached a window it could score - so the
@@ -295,25 +285,17 @@ func TestReadWhileWritingIsRaceFree(t *testing.T) {
 
 	windowOut, windowErr := runChild(raceRowWindowEnv)
 
-	// The known-bug arm keys on the detector's report naming the
-	// Attribute frame, a presence a fixed library does not show, so the
-	// exit code is consulted only past this arm, as README.md says.
-	if everyRaceReportNamesAttribute(windowOut) && knownBug != "" {
-		t.Logf("known bug: %s (the detector reported the conflict on the "+
-			"frame the constant names, in the window child: %s)",
-			knownBug, excerpt(windowOut))
-		return
-	}
+	// A child that raced exits nonzero whatever else it did, so the
+	// report is read first and the exit code is consulted only past this
+	// arm, as README.md says.
 	if strings.Contains(windowOut, raceReport) {
-		t.Errorf("the detector reported a conflict in the window child that "+
-			"the knownBug arm does not cover - a race outside %q, or the "+
-			"known race back after the constant was deleted (child output: %s)",
-			raceFrameAttribute, excerpt(windowOut))
+		t.Errorf("the detector reported a conflict in the window child "+
+			"(child output: %s)", excerpt(windowOut))
 		return
 	}
 
 	// With no report in the output the exit and the count are material: a
-	// clean child past the floor is the deletion arm's precondition, and
+	// clean child past the floor is the pass, and
 	// the count is what separates a scored window from an empty run.
 	reads, why := parseReads(windowOut)
 	if why != "" {
@@ -334,11 +316,6 @@ func TestReadWhileWritingIsRaceFree(t *testing.T) {
 	}
 
 	switch {
-	case windowErr == nil && reads >= readFloor && knownBug != "":
-		t.Errorf("this now passes (the window child completed %d reads in %v "+
-			"under -race with no detector report) - delete the knownBug "+
-			"constant, every arm that reads it, and anything only those arms "+
-			"used, in the commit that fixed it", reads, windowLen)
 	case windowErr == nil && reads >= readFloor:
 		t.Logf("the window child completed %d reads in %v under -race with "+
 			"no detector report", reads, windowLen)
@@ -362,21 +339,6 @@ func TestReadWhileWritingIsRaceFree(t *testing.T) {
 			"child completed %d reads, then failed a check of its own after "+
 			"the window - its line: %s", reads, excerpt(windowOut))
 	}
-}
-
-// everyRaceReportNamesAttribute reports whether the child's output holds
-// at least one detector report and every report names the Attribute frame.
-func everyRaceReportNamesAttribute(out string) bool {
-	blocks := strings.Split(out, raceReport)
-	if len(blocks) <= 1 {
-		return false
-	}
-	for _, block := range blocks[1:] {
-		if !strings.Contains(block, raceFrameAttribute) {
-			return false
-		}
-	}
-	return true
 }
 
 // runChild re-runs this test binary with -test.run pinned to this row's
