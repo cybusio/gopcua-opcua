@@ -132,6 +132,10 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 	if resp == nil {
 		return
 	}
+	if ctx.Err() != nil {
+		// The secure channel ended while the request was handled.
+		return
+	}
 
 	err = sc.SendResponseWithContext(ctx, reqID, resp)
 	if err != nil {
