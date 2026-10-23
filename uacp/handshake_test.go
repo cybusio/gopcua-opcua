@@ -180,50 +180,155 @@ func TestListener_HandshakeContextCompletesBeforeDone(t *testing.T) {
 	require.Equal(t, "ping", string(b))
 }
 
-// The connection a ReverseHello dialed is the one the handshake returns, and
-// closing it closes that connection.
-func TestListener_HandshakeReverseHelloConnectionCloses(t *testing.T) {
+// message returns a message of type typ and chunk type F with body.
+func message(t *testing.T, typ string, body []byte) []byte {
+	t.Helper()
+	hdr, err := (&Header{MessageType: typ, ChunkType: 'F', MessageSize: uint32(len(body) + hdrlen)}).Encode()
+	require.NoError(t, err)
+	return append(hdr, body...)
+}
+
+func encode(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := ua.Encode(v)
+	require.NoError(t, err)
+	return b
+}
+
+// requireRejected reads c until the server closes it and requires exactly one
+// Error message with code before the close, and the close before deadline.
+func requireRejected(t *testing.T, c net.Conn, code ua.StatusCode, deadline time.Time) {
+	t.Helper()
+	require.NoError(t, c.SetReadDeadline(deadline))
+	b, err := io.ReadAll(c) // a reset after the Error counts as the close
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		t.Fatalf("the connection is still open (read %q)", b)
+	}
+	require.GreaterOrEqual(t, len(b), hdrlen, "no Error message before the close")
+	var h Header
+	_, err = h.Decode(b)
+	require.NoError(t, err)
+	require.Equal(t, "ERRF", h.MessageType+string(h.ChunkType))
+	require.EqualValues(t, len(b), h.MessageSize, "one Error message and nothing else")
+	var e Error
+	_, err = e.Decode(b[hdrlen:])
+	require.NoError(t, err)
+	require.Equal(t, code, ua.StatusCode(e.ErrorCode))
+}
+
+// handshakeAsync accepts the next connection to l and runs the handshake on
+// it with a timeout far beyond the test, so that the timeout cannot be what
+// ends it.
+func handshakeAsync(t *testing.T, l *Listener) <-chan error {
+	t.Helper()
+	tc, err := l.AcceptTCP()
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() {
+		conn, err := l.HandshakeContext(context.Background(), tc, time.Minute)
+		if conn != nil {
+			_ = conn.Close()
+		}
+		done <- err
+	}()
+	return done
+}
+
+// A server accepts only Hello as the first message (Part 6 §7.1.3). Any other
+// message type, ReverseHello included, is answered with an Error
+// Bad_TcpMessageTypeInvalid (Part 6 §7.1.5) and the connection is closed at
+// once. A ReverseHello is sent by a server to a client on a connection the
+// server opened (Part 6 §7.1.2.6), so the listener does not connect to the
+// ServerUri it names, whatever its EndpointUrl.
+func TestListener_HandshakeRejectsEveryFirstMessageButHello(t *testing.T) {
 	l, err := Listen(context.Background(), "opc.tcp://127.0.0.1:0", nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = l.Close() })
 	back, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = back.Close() })
+	serverURI := back.Addr().String()
 
-	c, err := net.Dial("tcp", l.Addr().String())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Close() })
-	body, err := ua.Encode(&ReverseHello{ServerURI: back.Addr().String(), EndpointURL: l.Endpoint()})
-	require.NoError(t, err)
-	hdr, err := (&Header{MessageType: "RHE", ChunkType: 'F', MessageSize: uint32(len(body) + hdrlen)}).Encode()
-	require.NoError(t, err)
-	_, err = c.Write(append(hdr, body...))
-	require.NoError(t, err)
+	tests := []struct {
+		name string
+		msg  []byte
+	}{
+		{"ReverseHello for the endpoint", message(t, "RHE", encode(t, &ReverseHello{ServerURI: serverURI, EndpointURL: l.Endpoint()}))},
+		{"ReverseHello for another endpoint", message(t, "RHE", encode(t, &ReverseHello{ServerURI: serverURI, EndpointURL: "opc.tcp://192.0.2.1:4840"}))},
+		{"ReverseHello that does not decode", message(t, "RHE", []byte{0xff, 0xff, 0xff, 0x7f})},
+		{"MSG", message(t, "MSG", nil)},
+		{"OPN", message(t, "OPN", nil)},
+		{"CLO", message(t, "CLO", nil)},
+		{"ACK", message(t, "ACK", encode(t, DefaultClientACK))},
+		{"ERR", message(t, "ERR", encode(t, &Error{ErrorCode: uint32(ua.StatusBadTCPInternalError)}))},
+		{"unknown type", message(t, "XYZ", nil)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c, err := net.Dial("tcp", l.Addr().String())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			_, err = c.Write(tt.msg)
+			require.NoError(t, err)
+			start := time.Now()
+			done := handshakeAsync(t, l)
 
-	tc, err := l.AcceptTCP()
-	require.NoError(t, err)
-	srv, err := l.HandshakeContext(context.Background(), tc, time.Minute)
-	require.NoError(t, err)
-	peer, err := back.Accept()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = peer.Close() })
+			requireRejected(t, c, ua.StatusBadTCPMessageTypeInvalid, start.Add(time.Second))
+			select {
+			case err := <-done:
+				require.Error(t, err, "the handshake must fail")
+			case <-time.After(time.Second):
+				t.Fatal("the handshake did not end")
+			}
+		})
+	}
 
-	_ = srv.Close()
-	requireClosedWithoutAck(t, peer, time.Now().Add(2*time.Second))
+	// A connect in response would have been made by now; allow for a late one.
+	require.NoError(t, back.(*net.TCPListener).SetDeadline(time.Now().Add(time.Second)))
+	if peer, err := back.Accept(); err == nil {
+		_ = peer.Close()
+		t.Fatal("the listener connected to the ServerUri of a ReverseHello")
+	}
 }
 
-// The handshake timeout bounds the dial a ReverseHello asks for, too.
-func TestListener_HandshakeTimeoutBoundsReverseHelloDial(t *testing.T) {
-	const blackhole = "10.255.255.1:4840"
-	if c, err := net.DialTimeout("tcp", blackhole, 300*time.Millisecond); err == nil {
-		_ = c.Close()
-		t.Skipf("%s answers here", blackhole)
-	} else {
-		var ne net.Error
-		if !errors.As(err, &ne) || !ne.Timeout() {
-			t.Skipf("connect to %s fails fast here (%v)", blackhole, err)
-		}
+// A first message larger than the receive buffer is rejected on its header,
+// without waiting for its body: a Hello with Bad_TcpMessageTooLarge, any other
+// type with Bad_TcpMessageTypeInvalid.
+func TestListener_HandshakeRejectsAnOversizedFirstMessage(t *testing.T) {
+	l, err := Listen(context.Background(), "opc.tcp://127.0.0.1:0", nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+
+	tests := []struct {
+		typ  string
+		code ua.StatusCode
+	}{
+		{"RHE", ua.StatusBadTCPMessageTypeInvalid},
+		{"MSG", ua.StatusBadTCPMessageTypeInvalid},
+		{"HEL", ua.StatusBadTCPMessageTooLarge},
 	}
+	for _, tt := range tests {
+		t.Run(tt.typ, func(t *testing.T) {
+			c, err := net.Dial("tcp", l.Addr().String())
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			hdr, err := (&Header{MessageType: tt.typ, ChunkType: 'F', MessageSize: DefaultReceiveBufSize + 1}).Encode()
+			require.NoError(t, err)
+			_, err = c.Write(hdr)
+			require.NoError(t, err)
+			start := time.Now()
+			done := handshakeAsync(t, l)
+
+			requireRejected(t, c, tt.code, start.Add(time.Second))
+			require.Error(t, <-done)
+		})
+	}
+}
+
+// A Hello is still acknowledged after rejected first messages on the same
+// listener.
+func TestListener_HandshakeAcknowledgesHelloAfterARejection(t *testing.T) {
 	l, err := Listen(context.Background(), "opc.tcp://127.0.0.1:0", nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = l.Close() })
@@ -231,24 +336,22 @@ func TestListener_HandshakeTimeoutBoundsReverseHelloDial(t *testing.T) {
 	c, err := net.Dial("tcp", l.Addr().String())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
-	body, err := ua.Encode(&ReverseHello{ServerURI: blackhole, EndpointURL: l.Endpoint()})
+	_, err = c.Write(message(t, "RHE", encode(t, &ReverseHello{ServerURI: "127.0.0.1:1", EndpointURL: l.Endpoint()})))
 	require.NoError(t, err)
-	hdr, err := (&Header{MessageType: "RHE", ChunkType: 'F', MessageSize: uint32(len(body) + hdrlen)}).Encode()
-	require.NoError(t, err)
-	_, err = c.Write(append(hdr, body...))
-	require.NoError(t, err)
+	done := handshakeAsync(t, l)
+	requireRejected(t, c, ua.StatusBadTCPMessageTypeInvalid, time.Now().Add(time.Second))
+	require.Error(t, <-done)
 
-	tc, err := l.AcceptTCP()
-	require.NoError(t, err)
-	done := make(chan error, 1)
+	dialed := make(chan *Conn, 1)
 	go func() {
-		_, err := l.HandshakeContext(context.Background(), tc, 500*time.Millisecond)
-		done <- err
+		c, err := Dial(context.Background(), "opc.tcp://"+l.Addr().String())
+		if err != nil {
+			t.Errorf("dial: %v", err)
+		}
+		dialed <- c
 	}()
-	select {
-	case err := <-done:
-		require.Error(t, err, "the dial cannot succeed")
-	case <-time.After(3 * time.Second):
-		t.Fatal("the ReverseHello dial outlived the handshake timeout")
-	}
+	require.NoError(t, <-handshakeAsync(t, l))
+	cli := <-dialed
+	require.NotNil(t, cli, "the Hello was not acknowledged")
+	_ = cli.Close()
 }
