@@ -13,16 +13,16 @@ import (
 	"github.com/gopcua/opcua/ua"
 )
 
-// startAcceptTestServer starts a server on a free port and returns its endpoint
-// once it answers.
-func startAcceptTestServer(t *testing.T) string {
+// startAcceptTestServer starts a server on a free port with opts and returns
+// its endpoint once it answers.
+func startAcceptTestServer(t *testing.T, opts ...Option) string {
 	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
 	require.NoError(t, ln.Close())
 
-	srv := New(EndPoint("127.0.0.1", port), EnableSecurity("None", ua.MessageSecurityModeNone))
+	srv := New(append([]Option{EndPoint("127.0.0.1", port), EnableSecurity("None", ua.MessageSecurityModeNone)}, opts...)...)
 	ctx, cancel := context.WithCancel(context.Background())
 	require.NoError(t, srv.Start(ctx))
 	t.Cleanup(func() {

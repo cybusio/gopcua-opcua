@@ -116,6 +116,19 @@ func EnableAuthMode(tokenType ua.UserTokenType) Option {
 	}
 }
 
+// HandshakeTimeout sets the period a client has, from the moment its TCP
+// connection is accepted, to send Hello and so complete the UACP handshake.
+// The server closes a connection that does not (Part 6 §7.1.3). The period
+// runs from the accept: data that arrives in part does not extend it. The
+// default is 10 seconds. A d of zero or less is ignored.
+func HandshakeTimeout(d time.Duration) Option {
+	return func(s *serverConfig) {
+		if d > 0 {
+			s.handshakeTimeout = d
+		}
+	}
+}
+
 func defaultChannelConfig() *uasc.Config {
 	return &uasc.Config{
 		SecurityPolicyURI: ua.SecurityPolicyURINone,
