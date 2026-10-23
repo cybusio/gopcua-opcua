@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/gopcua/opcua/errors"
+	"github.com/gopcua/opcua/ua"
 	"github.com/stretchr/testify/require"
 )
 
@@ -60,6 +61,51 @@ func TestConn(t *testing.T) {
 			t.Error(err)
 		}
 	})
+}
+
+// Receive returns an Error message as an error, not as a message, and reads
+// exactly that message from the connection.
+func TestConn_ReceiveReturnsAnErrorMessageAsError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	peer, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = peer.Close() })
+	tc, err := ln.Accept()
+	require.NoError(t, err)
+	c, err := NewConn(tc.(*net.TCPConn), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+
+	frame := func(typ string, body []byte) []byte {
+		hdr, err := (&Header{MessageType: typ, ChunkType: 'F', MessageSize: uint32(len(body) + hdrlen)}).Encode()
+		require.NoError(t, err)
+		return append(hdr, body...)
+	}
+	errBody, err := ua.Encode(&Error{ErrorCode: uint32(ua.StatusBadTCPMessageTooLarge), Reason: "too large"})
+	require.NoError(t, err)
+	msgBody := []byte{0xde, 0xad, 0xbe, 0xef}
+	_, err = peer.Write(append(append(frame("ERR", errBody), frame("MSG", msgBody)...), frame("ERR", []byte{0xff, 0xff})...))
+	require.NoError(t, err)
+
+	b, err := c.Receive()
+	require.Nil(t, b, "an Error message must not be returned as a message")
+	var e *Error
+	require.ErrorAs(t, err, &e)
+	require.Equal(t, uint32(ua.StatusBadTCPMessageTooLarge), e.ErrorCode)
+	require.Equal(t, "too large", e.Reason)
+	require.ErrorIs(t, err, ua.StatusBadTCPMessageTooLarge)
+
+	b, err = c.Receive()
+	require.NoError(t, err, "the message after the Error must be read whole")
+	require.Equal(t, msgBody, b[hdrlen:])
+
+	b, err = c.Receive()
+	require.Nil(t, b, "an Error message that does not decode must not be returned as a message")
+	require.Error(t, err)
+	require.False(t, errors.As(err, &e), "an Error message that does not decode has no error code")
 }
 
 func TestClientWrite(t *testing.T) {
