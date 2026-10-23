@@ -122,6 +122,10 @@ type serverConfig struct {
 	cap ServerCapabilities
 
 	logger Logger
+
+	// handshakeTimeout bounds the UACP handshake of one connection, from
+	// the accept to the Acknowledge. Set with HandshakeTimeout.
+	handshakeTimeout time.Duration
 }
 
 var capabilities = ServerCapabilities{
@@ -170,6 +174,7 @@ func New(opts ...Option) *Server {
 		manufacturerName: "The gopcua Team",      // override with the ManufacturerName option
 		productName:      "gopcua OPC/UA Server", // override with the ProductName option
 		softwareVersion:  "0.0.0-dev",            // override with the SoftwareVersion option
+		handshakeTimeout: defaultHandshakeTimeout,
 	}
 	for _, opt := range opts {
 		opt(cfg)
@@ -370,9 +375,10 @@ func (s *Server) Close() error {
 	return s.cb.Close()
 }
 
-// handshakeTimeout bounds the UACP handshake of one connection. A client sends
-// Hello right after connecting, so this only ends connections that never will.
-const handshakeTimeout = 10 * time.Second
+// defaultHandshakeTimeout bounds the UACP handshake of one connection unless
+// HandshakeTimeout sets another period. A client sends Hello right after
+// connecting, so this only ends connections that never will.
+const defaultHandshakeTimeout = 10 * time.Second
 
 // acceptAndRegister accepts connections until the listener is closed.
 //
@@ -409,7 +415,7 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 // handshakeAndRegister completes the UACP handshake on c and hands the
 // connection to the channel broker.
 func (s *Server) handshakeAndRegister(ctx context.Context, l *uacp.Listener, c *net.TCPConn) {
-	conn, err := l.Handshake(c, handshakeTimeout)
+	conn, err := l.Handshake(c, s.cfg.handshakeTimeout)
 	if err != nil {
 		if s.cfg.logger != nil {
 			s.cfg.logger.Warn("handshake with %s failed: %s", c.RemoteAddr(), err)
