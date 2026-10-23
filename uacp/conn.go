@@ -172,15 +172,52 @@ func (l *Listener) AcceptTCP() (*net.TCPConn, error) {
 // returned, and returns the established connection. A timeout greater than zero
 // bounds the handshake. c is closed when the handshake fails.
 func (l *Listener) Handshake(c *net.TCPConn, timeout time.Duration) (*Conn, error) {
+	return l.HandshakeContext(context.Background(), c, timeout)
+}
+
+// HandshakeContext is Handshake ended by ctx as well: once ctx is done, c is
+// closed and the handshake fails. No Acknowledge is started once ctx is done;
+// one already started is written in full before c is closed. A client whose
+// Hello arrives after ctx is done therefore finds the connection closed. A
+// server that is shutting down uses it to close the connections still waiting
+// for Hello. ctx ends the handshake only, not the connection it returns.
+func (l *Listener) HandshakeContext(ctx context.Context, c *net.TCPConn, timeout time.Duration) (*Conn, error) {
+	var deadline time.Time
 	if timeout > 0 {
-		if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
+		deadline = time.Now().Add(timeout)
+		if err := c.SetDeadline(deadline); err != nil {
 			c.Close()
 			return nil, err
 		}
 	}
 	conn := &Conn{TCPConn: c, id: nextid(), ack: l.ack}
-	if err := conn.srvhandshake(l.endpoint); err != nil {
+
+	// mu keeps the Acknowledge and the close on ctx apart: an Acknowledge is
+	// started only while ctx is not done, and c is closed only after it.
+	var mu sync.Mutex
+	stop := context.AfterFunc(ctx, func() {
+		mu.Lock()
+		defer mu.Unlock()
 		c.Close()
+	})
+	ack := func() error {
+		mu.Lock()
+		defer mu.Unlock()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return conn.Send("ACKF", conn.ack)
+	}
+	err := conn.srvhandshake(ctx, l.endpoint, deadline, ack)
+	if !stop() && err == nil {
+		// ctx was done after the Acknowledge; c is being closed.
+		err = ctx.Err()
+	}
+	if err != nil {
+		c.Close()
+		if conn.TCPConn != c {
+			conn.TCPConn.Close()
+		}
 		return nil, err
 	}
 	if timeout > 0 {
@@ -321,10 +358,15 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 	}
 }
 
-func (c *Conn) srvhandshake(endpoint string) error {
+// srvhandshake runs the server side of the handshake; ack writes the
+// Acknowledge to a Hello. The handshake ends when ctx is done, and a
+// ReverseHello dial at deadline unless it is zero.
+func (c *Conn) srvhandshake(ctx context.Context, endpoint string, deadline time.Time, ack func() error) error {
 	b, err := c.Receive()
 	if err != nil {
-		c.SendError(ua.StatusBadTCPInternalError)
+		if ctx.Err() == nil {
+			c.SendError(ua.StatusBadTCPInternalError)
+		}
 		return err
 	}
 
@@ -344,8 +386,10 @@ func (c *Conn) srvhandshake(endpoint string) error {
 		//	c.SendError(ua.StatusBadTCPEndpointURLInvalid)
 		//	return fmt.Errorf("uacp: invalid endpoint url %s", hel.EndpointURL)
 		//}
-		if err := c.Send("ACKF", c.ack); err != nil {
-			c.SendError(ua.StatusBadTCPInternalError)
+		if err := ack(); err != nil {
+			if ctx.Err() == nil {
+				c.SendError(ua.StatusBadTCPInternalError)
+			}
 			return err
 		}
 		debug.Printf("uacp %d: recv %#v", c.id, hel)
@@ -362,9 +406,11 @@ func (c *Conn) srvhandshake(endpoint string) error {
 			return errors.Errorf("uacp: invalid endpoint url %s", rhe.EndpointURL)
 		}
 		debug.Printf("uacp %d: connecting to %s", c.id, rhe.ServerURI)
-		c.Close()
-		var dialer net.Dialer
-		c2, err := dialer.DialContext(context.Background(), "tcp", rhe.ServerURI)
+		// Close the TCP connection only: Close would use up closeOnce, and
+		// the connection dialed below could then never be closed.
+		c.TCPConn.Close()
+		dialer := net.Dialer{Deadline: deadline}
+		c2, err := dialer.DialContext(ctx, "tcp", rhe.ServerURI)
 		if err != nil {
 			return err
 		}
