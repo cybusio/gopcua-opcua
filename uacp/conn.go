@@ -182,10 +182,8 @@ func (l *Listener) Handshake(c *net.TCPConn, timeout time.Duration) (*Conn, erro
 // server that is shutting down uses it to close the connections still waiting
 // for Hello. ctx ends the handshake only, not the connection it returns.
 func (l *Listener) HandshakeContext(ctx context.Context, c *net.TCPConn, timeout time.Duration) (*Conn, error) {
-	var deadline time.Time
 	if timeout > 0 {
-		deadline = time.Now().Add(timeout)
-		if err := c.SetDeadline(deadline); err != nil {
+		if err := c.SetDeadline(time.Now().Add(timeout)); err != nil {
 			c.Close()
 			return nil, err
 		}
@@ -208,23 +206,18 @@ func (l *Listener) HandshakeContext(ctx context.Context, c *net.TCPConn, timeout
 		}
 		return conn.Send("ACKF", conn.ack)
 	}
-	err := conn.srvhandshake(ctx, l.endpoint, deadline, ack)
+	err := conn.srvhandshake(ctx, ack)
 	if !stop() && err == nil {
 		// ctx was done after the Acknowledge; c is being closed.
 		err = ctx.Err()
 	}
 	if err != nil {
 		c.Close()
-		if conn.TCPConn != c {
-			conn.TCPConn.Close()
-		}
 		return nil, err
 	}
 	if timeout > 0 {
-		// The handshake may have replaced the connection (ReverseHello), so
-		// clear the deadline on the one it ended with.
-		if err := conn.TCPConn.SetDeadline(time.Time{}); err != nil {
-			conn.TCPConn.Close()
+		if err := c.SetDeadline(time.Time{}); err != nil {
+			c.Close()
 			return nil, err
 		}
 	}
@@ -359,18 +352,23 @@ func (c *Conn) Handshake(ctx context.Context, endpoint string) error {
 }
 
 // srvhandshake runs the server side of the handshake; ack writes the
-// Acknowledge to a Hello. The handshake ends when ctx is done, and a
-// ReverseHello dial at deadline unless it is zero.
-func (c *Conn) srvhandshake(ctx context.Context, endpoint string, deadline time.Time, ack func() error) error {
-	b, err := c.Receive()
+// Acknowledge to a Hello. The handshake ends when ctx is done.
+//
+// A client opens a connection with Hello (Part 6 §7.1.3), so Hello is the only
+// first message a server accepts. Any other type is answered with
+// Bad_TcpMessageTypeInvalid (Part 6 §7.1.5) and ends the handshake. That
+// includes ReverseHello: a server sends it to a client on a connection the
+// server opened (Part 6 §7.1.2.6), and a server that receives one does not act
+// on it.
+func (c *Conn) srvhandshake(ctx context.Context, ack func() error) error {
+	h, b, err := c.receive()
 	if err != nil {
 		if ctx.Err() == nil {
-			c.SendError(ua.StatusBadTCPInternalError)
+			c.SendError(rejectCode(h, c.ack.ReceiveBufSize))
 		}
 		return err
 	}
 
-	// HEL or RHE?
 	msgtyp := string(b[:4])
 	msg := b[hdrlen:]
 	switch msgtyp {
@@ -380,12 +378,6 @@ func (c *Conn) srvhandshake(ctx context.Context, endpoint string, deadline time.
 			c.SendError(ua.StatusBadTCPInternalError)
 			return err
 		}
-		// TODO (dh): Temporarily disabled until a proper fix can be implemented.
-		// Problem is that when listening on a random port, (eg. :0), this check fails
-		//if hel.EndpointURL != endpoint {
-		//	c.SendError(ua.StatusBadTCPEndpointURLInvalid)
-		//	return fmt.Errorf("uacp: invalid endpoint url %s", hel.EndpointURL)
-		//}
 		if err := ack(); err != nil {
 			if ctx.Err() == nil {
 				c.SendError(ua.StatusBadTCPInternalError)
@@ -395,40 +387,28 @@ func (c *Conn) srvhandshake(ctx context.Context, endpoint string, deadline time.
 		debug.Printf("uacp %d: recv %#v", c.id, hel)
 		return nil
 
-	case "RHEF":
-		rhe := new(ReverseHello)
-		if _, err := rhe.Decode(msg); err != nil {
-			c.SendError(ua.StatusBadTCPInternalError)
-			return err
-		}
-		if rhe.EndpointURL != endpoint {
-			c.SendError(ua.StatusBadTCPEndpointURLInvalid)
-			return errors.Errorf("uacp: invalid endpoint url %s", rhe.EndpointURL)
-		}
-		debug.Printf("uacp %d: connecting to %s", c.id, rhe.ServerURI)
-		// Close the TCP connection only: Close would use up closeOnce, and
-		// the connection dialed below could then never be closed.
-		c.TCPConn.Close()
-		dialer := net.Dialer{Deadline: deadline}
-		c2, err := dialer.DialContext(ctx, "tcp", rhe.ServerURI)
-		if err != nil {
-			return err
-		}
-		c.TCPConn = c2.(*net.TCPConn)
-		debug.Printf("uacp %d: recv %#v", c.id, rhe)
-		return nil
-
-	case "ERRF":
-		errf := new(Error)
-		if _, err := errf.Decode(b[hdrlen:]); err != nil {
-			return errors.Errorf("uacp: decode ERR failed: %s", err)
-		}
-		debug.Printf("uacp %d: recv %#v", c.id, errf)
-		return errf
-
 	default:
-		c.SendError(ua.StatusBadTCPInternalError)
+		if ctx.Err() == nil {
+			c.SendError(ua.StatusBadTCPMessageTypeInvalid)
+		}
 		return errors.Errorf("invalid handshake packet %q", msgtyp)
+	}
+}
+
+// rejectCode returns the error code for a first message that receive failed
+// on, with header h if it was read. A message other than Hello is rejected for
+// its type, before its size.
+func rejectCode(h Header, receiveBufSize uint32) ua.StatusCode {
+	switch {
+	case h.MessageType == "":
+		// The header was not read.
+		return ua.StatusBadTCPInternalError
+	case h.MessageType != MessageTypeHello || h.ChunkType != ChunkTypeFinal:
+		return ua.StatusBadTCPMessageTypeInvalid
+	case h.MessageSize > receiveBufSize:
+		return ua.StatusBadTCPMessageTooLarge
+	default:
+		return ua.StatusBadTCPInternalError
 	}
 }
 
@@ -439,6 +419,24 @@ const hdrlen = 8
 // The size of b must be at least ReceiveBufSize. Otherwise,
 // the function returns an error.
 func (c *Conn) Receive() ([]byte, error) {
+	h, b, err := c.receive()
+	if err != nil {
+		return nil, err
+	}
+	if h.MessageType == MessageTypeError {
+		errf := new(Error)
+		if _, err := errf.Decode(b[hdrlen:]); err != nil {
+			return nil, errors.Errorf("uacp: failed to decode ERRF message: %s", err)
+		}
+		return nil, errf
+	}
+	return b, nil
+}
+
+// receive reads a full UACP message, an Error message included, and returns
+// its header and bytes. The header is also returned when the message is
+// rejected after the header was read.
+func (c *Conn) receive() (Header, []byte, error) {
 	// TODO(kung-foo): allow user-specified buffer
 	// TODO(kung-foo): sync.Pool
 	b := make([]byte, c.ack.ReceiveBufSize)
@@ -446,37 +444,29 @@ func (c *Conn) Receive() ([]byte, error) {
 	if _, err := io.ReadFull(c, b[:hdrlen]); err != nil {
 		// todo(fs): do not wrap this error since it hides io.EOF
 		// todo(fs): use golang.org/x/xerrors
-		return nil, err
+		return Header{}, nil, err
 	}
 
 	var h Header
 	if _, err := h.Decode(b[:hdrlen]); err != nil {
-		return nil, errors.Errorf("uacp: header decode failed: %s", err)
+		return Header{}, nil, errors.Errorf("uacp: header decode failed: %s", err)
 	}
 
 	if h.MessageSize > c.ack.ReceiveBufSize {
-		return nil, errors.Errorf("uacp: message too large: %d > %d bytes. MsgType=%s, ChunkType=%c", h.MessageSize, c.ack.ReceiveBufSize, h.MessageType, h.ChunkType)
+		return h, nil, errors.Errorf("uacp: message too large: %d > %d bytes. MsgType=%s, ChunkType=%c", h.MessageSize, c.ack.ReceiveBufSize, h.MessageType, h.ChunkType)
 	}
 	if h.MessageSize < hdrlen {
-		return nil, errors.Errorf("uacp: message too small: %d bytes. MsgType=%s, ChunkType=%c.", h.MessageSize, h.MessageType, h.ChunkType)
+		return h, nil, errors.Errorf("uacp: message too small: %d bytes. MsgType=%s, ChunkType=%c.", h.MessageSize, h.MessageType, h.ChunkType)
 	}
 
 	if _, err := io.ReadFull(c, b[hdrlen:h.MessageSize]); err != nil {
 		// todo(fs): do not wrap this error since it hides io.EOF
 		// todo(fs): use golang.org/x/xerrors
-		return nil, err
+		return h, nil, err
 	}
 
 	debug.Printf("uacp %d: recv %s%c with %d bytes", c.id, h.MessageType, h.ChunkType, h.MessageSize)
-
-	if h.MessageType == "ERR" {
-		errf := new(Error)
-		if _, err := errf.Decode(b[hdrlen:h.MessageSize]); err != nil {
-			return nil, errors.Errorf("uacp: failed to decode ERRF message: %s", err)
-		}
-		return nil, errf
-	}
-	return b[:h.MessageSize], nil
+	return h, b[:h.MessageSize], nil
 }
 
 func (c *Conn) Send(typ string, msg interface{}) error {
