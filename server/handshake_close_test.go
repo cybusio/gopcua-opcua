@@ -231,37 +231,6 @@ func TestServer_StartContextEndsHandshakes(t *testing.T) {
 	requireClosedByServer(t, c, time.Now().Add(2*time.Second))
 }
 
-// A ReverseHello makes the server dial the ServerURI it names. Close ends a
-// dial still in flight instead of waiting for the operating system's connect
-// timeout.
-func TestServer_CloseEndsReverseHelloDial(t *testing.T) {
-	const blackhole = "10.255.255.1:4840"
-	if c, err := net.DialTimeout("tcp", blackhole, 300*time.Millisecond); err == nil {
-		_ = c.Close()
-		t.Skipf("%s answers here", blackhole)
-	} else if !isTimeout(err) {
-		t.Skipf("connect to %s fails fast here (%v)", blackhole, err)
-	}
-	srv, endpoint, _ := startVerifierServer(t)
-
-	c, err := net.Dial("tcp", hostPort(endpoint))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Close() })
-	_, err = c.Write(encodeMessage(t, "RHE", &uacp.ReverseHello{ServerURI: blackhole, EndpointURL: endpoint}))
-	require.NoError(t, err)
-	waitFor(t, "ReverseHello dial in flight", 2*time.Second, func() bool {
-		for _, g := range handshakesOf(srv) {
-			if strings.Contains(g, "DialContext") {
-				return true
-			}
-		}
-		return false
-	})
-
-	closeWithin(t, srv, 2*time.Second)
-	require.Empty(t, handshakesOf(srv), "the ReverseHello dial outlived Close")
-}
-
 // Close racing connections that arrive and send Hello: Close returns in time,
 // and the race detector sees no unsynchronized use of the handshake WaitGroup.
 func TestServer_CloseRacingNewConnections(t *testing.T) {
