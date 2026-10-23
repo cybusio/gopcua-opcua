@@ -65,6 +65,15 @@ type Server struct {
 	cb *channelBroker
 	sb *sessionBroker
 
+	// hsMu guards hsCancel and hsClosed. Handshakes run on hsCtx, which
+	// Close cancels; handshakes counts them so that Close can wait for
+	// their connections to be closed.
+	hsMu       sync.Mutex
+	hsCtx      context.Context
+	hsCancel   context.CancelFunc
+	hsClosed   bool
+	handshakes sync.WaitGroup
+
 	// nextSecureChannelID uint32
 
 	// Service Handlers are methods called to respond to service requests from clients
@@ -350,6 +359,11 @@ func (s *Server) Start(ctx context.Context) error {
 		s.cb = newChannelBroker(s.cfg.logger)
 	}
 
+	s.hsMu.Lock()
+	s.hsCtx, s.hsCancel = context.WithCancel(ctx)
+	s.hsClosed = false
+	s.hsMu.Unlock()
+
 	go s.acceptAndRegister(ctx, s.l)
 
 	return nil
@@ -366,10 +380,20 @@ func (s *Server) setServerState(state ua.ServerState) {
 func (s *Server) Close() error {
 	s.setServerState(ua.ServerStateShutdown)
 
+	// End the handshakes: their connections are closed, and no Hello is
+	// acknowledged from here on.
+	s.hsMu.Lock()
+	s.hsClosed = true
+	if s.hsCancel != nil {
+		s.hsCancel()
+	}
+	s.hsMu.Unlock()
+
 	// Close the listener, preventing new sessions from starting
 	if s.l != nil {
 		s.l.Close()
 	}
+	s.handshakes.Wait()
 
 	// Shut down all secure channels and UACP connections
 	return s.cb.Close()
@@ -408,16 +432,40 @@ func (s *Server) acceptAndRegister(ctx context.Context, l *uacp.Listener) {
 			continue
 		}
 		backoff = 0
+		if !s.addHandshake() {
+			// Close has begun.
+			c.Close()
+			return
+		}
 		go s.handshakeAndRegister(ctx, l, c)
 	}
+}
+
+// addHandshake counts a handshake about to start. It reports false once Close
+// has begun.
+func (s *Server) addHandshake() bool {
+	s.hsMu.Lock()
+	defer s.hsMu.Unlock()
+	if s.hsClosed {
+		return false
+	}
+	s.handshakes.Add(1)
+	return true
+}
+
+// handshake completes the UACP handshake on c, which addHandshake counted.
+func (s *Server) handshake(l *uacp.Listener, c *net.TCPConn) (*uacp.Conn, error) {
+	defer s.handshakes.Done()
+	return l.HandshakeContext(s.hsCtx, c, s.cfg.handshakeTimeout)
 }
 
 // handshakeAndRegister completes the UACP handshake on c and hands the
 // connection to the channel broker.
 func (s *Server) handshakeAndRegister(ctx context.Context, l *uacp.Listener, c *net.TCPConn) {
-	conn, err := l.Handshake(c, s.cfg.handshakeTimeout)
+	conn, err := s.handshake(l, c)
 	if err != nil {
-		if s.cfg.logger != nil {
+		// A handshake ended by Close is not a failure of the client.
+		if s.cfg.logger != nil && s.hsCtx.Err() == nil {
 			s.cfg.logger.Warn("handshake with %s failed: %s", c.RemoteAddr(), err)
 		}
 		return
