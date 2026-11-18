@@ -149,8 +149,15 @@ func (c *idleClient) expectClosed(d time.Duration, what string) {
 	}
 }
 
+// isConnReset reports whether err is the read error of a connection the peer
+// tore down. On Windows that is WSAECONNRESET (10054) or, for a read after a
+// write the peer answered with a reset, WSAECONNABORTED (10053);
+// syscall.ECONNRESET is an invented value there that no such error equals,
+// so the comparison is against the literal numbers, which compile on every
+// platform.
 func isConnReset(err error) bool {
-	return errors.Is(err, syscall.ECONNRESET)
+	return errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.Errno(10054)) || errors.Is(err, syscall.Errno(10053))
 }
 
 // waitChannels waits until the broker holds n channels.
