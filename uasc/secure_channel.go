@@ -190,6 +190,11 @@ type SecureChannel struct {
 	// receivers reject as a gap or a reuse. Senders take it before drawing
 	// the first number of a message and hold it until its last chunk is
 	// written, never while waiting for a response.
+	//
+	// A number is used up by a chunk on the connection, not by an attempt
+	// to send one: a message that fails before its first chunk is written
+	// hands its number back (see returnSequenceNumber), so the next message
+	// carries the successor of the last number the peer received.
 	sendSequenceNumber uint32
 	sendMu             sync.Mutex
 
@@ -1167,6 +1172,9 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
+	written := false
+	defer s.returnSequenceNumber(s.sendSequenceNumber, &written)
+
 	m, err := instance.newRequestMessage(req, reqID, authToken, timeout)
 	if err != nil {
 		return nil, err
@@ -1216,6 +1224,7 @@ func (s *SecureChannel) sendAsyncWithTimeout(
 		if n, err = s.c.Write(chunk); err != nil {
 			return nil, err
 		}
+		written = true
 		s.c.SetWriteDeadline(time.Time{})
 
 		atomic.AddUint64(&instance.bytesSent, uint64(n))
@@ -1314,8 +1323,13 @@ func (s *SecureChannel) SendMsgWithContext(ctx context.Context, instance *channe
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
+	written := false
+	defer s.returnSequenceNumber(s.sendSequenceNumber, &written)
+
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	n, err := s.writeMessageChunks(ctx, instance, reqID, m, resp)
+	written = n > 0
+	if err != nil {
 		return err
 	}
 
@@ -1344,8 +1358,13 @@ func (s *SecureChannel) sendResponseWithContext(ctx context.Context, instance *c
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 
+	written := false
+	defer s.returnSequenceNumber(s.sendSequenceNumber, &written)
+
 	m := instance.newMessage(resp, typeID, reqID)
-	if _, err := s.writeMessageChunks(ctx, instance, reqID, m, resp); err != nil {
+	n, err := s.writeMessageChunks(ctx, instance, reqID, m, resp)
+	written = n > 0
+	if err != nil {
 		return err
 	}
 
@@ -1374,6 +1393,28 @@ func (s *SecureChannel) nextSequenceNumber() uint32 {
 	}
 
 	return s.sendSequenceNumber
+}
+
+// returnSequenceNumber sets the send counter back to before, its value
+// before a message drew its first SequenceNumber, unless a chunk of that
+// message was written. A sender defers it right after taking sendMu.
+//
+// A message draws its first number when it is built, before it is encoded.
+// When it then fails without a chunk on the connection — the body cannot be
+// encoded, the context is already done, the first chunk cannot be signed —
+// the peer never sees that number, and the next message would skip it. OPC
+// 10000-6 §6.7.2.4 requires the number to be "incremented by exactly one for
+// each MessageChunk sent", and a receiver that checks it, as
+// verifyReceivedSequenceNumber does, fails the channel on the gap: one
+// message that could not be sent would cost every later one. Deferred, it
+// also covers an encoder that panics.
+//
+// Once a chunk is written the numbers drawn stay used: what follows a
+// partly written message is not a question of numbering.
+func (s *SecureChannel) returnSequenceNumber(before uint32, written *bool) {
+	if !*written {
+		s.sendSequenceNumber = before
+	}
 }
 
 // Close closes an existing secure channel
