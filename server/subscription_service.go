@@ -23,7 +23,14 @@ type SubscriptionService struct {
 func (s *SubscriptionService) DeleteSubscription(id uint32) {
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
+	s.deleteSubscriptionLocked(id)
+}
 
+// deleteSubscriptionLocked stops the subscription with the given id, removes
+// it from Subs, which frees its place under MaxSubscriptions and
+// MaxSubscriptionsPerSession, and deletes its monitored items. s.Mu must be
+// held.
+func (s *SubscriptionService) deleteSubscriptionLocked(id uint32) {
 	sub, ok := s.Subs[id]
 	if ok {
 		sub.Mu.Lock()
@@ -38,7 +45,68 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 
 	// ask the monitored item service to purge out any items that use this subscription
 	s.srv.MonitoredItemService.DeleteSub(id)
+}
 
+// endSubscription deletes sub when its background task ends. It does
+// nothing when sub was deleted already, so that a later subscription with
+// the same id is left in place.
+func (s *SubscriptionService) endSubscription(sub *Subscription) {
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+	if s.Subs[sub.ID] == sub {
+		s.deleteSubscriptionLocked(sub.ID)
+	}
+}
+
+// DeleteSessionSubscriptions deletes every subscription of the session with
+// the given authentication token and returns their ids. CloseSession calls it
+// when deleteSubscriptions is TRUE (Part 4 §5.7.4.2, Table 19); a server that
+// installs its own CloseSession handler can call it to do the same. The
+// subscriptions are gone, and their places under MaxSubscriptions and
+// MaxSubscriptionsPerSession are free, when it returns.
+func (s *SubscriptionService) DeleteSessionSubscriptions(authToken *ua.NodeID) []uint32 {
+	if authToken == nil {
+		return nil
+	}
+	token := authToken.String()
+
+	s.Mu.Lock()
+	defer s.Mu.Unlock()
+
+	var ids []uint32
+	for id, sub := range s.Subs {
+		if sub.Session != nil && sub.Session.AuthTokenID.String() == token {
+			ids = append(ids, id)
+		}
+	}
+	for _, id := range ids {
+		s.deleteSubscriptionLocked(id)
+	}
+	return ids
+}
+
+// limitReached reports whether one more Subscription for session would exceed
+// MaxSubscriptions or MaxSubscriptionsPerSession. A Subscription counts from
+// the CreateSubscription that returns it until it is removed from Subs.
+// s.Mu must be held.
+func (s *SubscriptionService) limitReached(session *session) bool {
+	limits := s.srv.cfg.cap
+	if limits.MaxSubscriptions > 0 && uint64(len(s.Subs)) >= uint64(limits.MaxSubscriptions) {
+		return true
+	}
+	if limits.MaxSubscriptionsPerSession == 0 || session == nil {
+		return false
+	}
+	var n uint32
+	for _, sub := range s.Subs {
+		if sub.Session == session {
+			n++
+			if n >= limits.MaxSubscriptionsPerSession {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.2
@@ -55,6 +123,13 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
+	session := s.srv.Session(r.Header())
+	if s.limitReached(session) {
+		return &ua.ServiceFault{
+			ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTooManySubscriptions),
+		}, nil
+	}
+
 	newsubid := uint32(len(s.Subs)) + 1
 
 	if s.srv.cfg.logger != nil {
@@ -63,7 +138,7 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 
 	sub := NewSubscription()
 	sub.srv = s
-	sub.Session = s.srv.Session(r.Header())
+	sub.Session = session
 	sub.Channel = sc
 	sub.ID = newsubid
 	sub.RevisedPublishingInterval = req.RequestedPublishingInterval
@@ -229,9 +304,9 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 			results[i] = ua.StatusBadSessionIDInvalid
 			continue
 		}
-		// delete subscription gets the lock so we set them up to run in the background
-		// once this function releases its lock
-		go s.DeleteSubscription(subid)
+		// The subscription is gone, and its place under the subscription
+		// limits is free, before the response is sent.
+		s.deleteSubscriptionLocked(subid)
 		results[i] = ua.StatusOK
 	}
 	return &ua.DeleteSubscriptionsResponse{
@@ -345,7 +420,7 @@ func (s *Subscription) run() {
 		if s.srv.srv.cfg.logger != nil {
 			s.srv.srv.cfg.logger.Info("Subscription %d shutting down.", s.ID)
 		}
-		s.srv.DeleteSubscription(s.ID)
+		s.srv.endSubscription(s)
 	}()
 
 	keepalive_counter := 0

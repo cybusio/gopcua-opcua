@@ -80,6 +80,14 @@ var capabilities = ServerCapabilities{
 
 type ServerCapabilities struct {
 	OperationalLimits OperationalLimits
+
+	// MaxSubscriptions is the largest number of Subscriptions the server
+	// holds at a time, for all Sessions together. Zero means no limit.
+	MaxSubscriptions uint32
+
+	// MaxSubscriptionsPerSession is the largest number of Subscriptions one
+	// Session holds at a time. Zero means no limit.
+	MaxSubscriptionsPerSession uint32
 }
 
 type OperationalLimits struct {
