@@ -160,6 +160,39 @@ func MaxNotificationsPerPublish(n uint32) Option {
 	}
 }
 
+// MaxSubscriptions sets the largest number of Subscriptions the server holds
+// at a time, for all Sessions together. While it is reached, CreateSubscription
+// answers Bad_TooManySubscriptions (Part 4 §5.14.2.4, Table 83). The server
+// reports it as ServerCapabilities.MaxSubscriptions (Part 5 §6.3.2), and 0
+// when no limit is set. A value of zero or less means no limit, the default;
+// a value above math.MaxUint32 is taken as math.MaxUint32.
+func MaxSubscriptions(n int) Option {
+	return func(s *serverConfig) {
+		s.cap.MaxSubscriptions = subscriptionLimit(n)
+	}
+}
+
+// MaxSubscriptionsPerSession sets the largest number of Subscriptions one
+// Session holds at a time. While it is reached, CreateSubscription in that
+// Session answers Bad_TooManySubscriptions (Part 4 §5.14.2.4, Table 83). The
+// server reports it as ServerCapabilities.MaxSubscriptionsPerSession
+// (Part 5 §6.3.2), and 0 when no limit is set. A value of zero or less means
+// no limit, the default; a value above math.MaxUint32 is taken as
+// math.MaxUint32.
+func MaxSubscriptionsPerSession(n int) Option {
+	return func(s *serverConfig) {
+		s.cap.MaxSubscriptionsPerSession = subscriptionLimit(n)
+	}
+}
+
+// subscriptionLimit converts a limit option to its UInt32 capability value.
+func subscriptionLimit(n int) uint32 {
+	if n <= 0 {
+		return 0
+	}
+	return uint32(min(uint64(n), math.MaxUint32))
+}
+
 func ServerName(name string) Option {
 	return func(s *serverConfig) {
 		s.applicationName = name

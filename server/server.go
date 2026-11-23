@@ -159,6 +159,14 @@ type ServerCapabilities struct {
 	// the server does not expose it in the address space. Set it with
 	// the MaxNotificationsPerPublish option.
 	MaxNotificationsPerPublish uint32
+
+	// MaxSubscriptions is the largest number of Subscriptions the server
+	// holds at a time, for all Sessions together. Zero means no limit.
+	MaxSubscriptions uint32
+
+	// MaxSubscriptionsPerSession is the largest number of Subscriptions one
+	// Session holds at a time. Zero means no limit.
+	MaxSubscriptionsPerSession uint32
 }
 
 type OperationalLimits struct {
