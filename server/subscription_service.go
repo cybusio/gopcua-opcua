@@ -142,7 +142,20 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	session := s.srv.Session(r.Header())
+	// A Subscription serves the Publish requests of the Session whose
+	// authenticationToken created it (Part 4 v1.05 §5.14.1.1, §7.32). When the
+	// token identifies no Session, the request is answered with a ServiceFault
+	// Bad_SessionIdInvalid (§7.34, §7.38.2 Table 178) and no Subscription is
+	// created or started. The Session is looked up while s.Mu is held: a
+	// Session closed concurrently either owns the new Subscription before a
+	// deletion of its Subscriptions under s.Mu runs, or is not found here.
+	session := s.srv.Session(req.RequestHeader)
+	if session == nil {
+		return &ua.ServiceFault{
+			ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadSessionIDInvalid),
+		}, nil
+	}
+
 	if s.limitReached(session) {
 		return &ua.ServiceFault{
 			ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadTooManySubscriptions),
@@ -304,6 +317,15 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 		return nil, err
 	}
 	session := s.srv.Session(req.Header())
+	if session == nil {
+		// Only Subscriptions of the Client's Session can be deleted
+		// (Part 4 v1.05 §5.14.8.1). Without a Session the request is answered
+		// with a ServiceFault Bad_SessionIdInvalid (§7.34, §7.38.2 Table 178)
+		// before any subscriptionId is looked at.
+		return &ua.ServiceFault{
+			ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusBadSessionIDInvalid),
+		}, nil
+	}
 
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
